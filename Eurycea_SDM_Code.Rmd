@@ -1,0 +1,2417 @@
+---
+title: "Eurycea_SDM"
+author: "Anthony Snead"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(java.parameters = "-Xmx100g")
+```
+
+# Libraries
+
+```{r, Libraries}
+library(geodata)
+library(rgbif)
+library(tidyverse)
+```
+
+# Genus Occurance Data
+
+```{r, Download Eurycea occurances from GBIF}
+# get the data frame for gbif
+Eurycea.GBIF <- rgbif::name_backbone(name = "Eurcyea",
+                                     genus = "Eurycea")$usageKey %>%
+  # get occurrences
+  rgbif::occ_data(taxonKey = .,
+                  hasCoordinate = TRUE,
+                  hasGeospatialIssue = FALSE,
+                  occurrenceStatus = "PRESENT",
+                  year = '2000,2024',
+                  coordinateUncertaintyInMeters = '0,1000',
+                  limit=100000) %>%
+  # get data
+  .$data %>%
+  # filter 
+  dplyr::filter(basisOfRecord != "FOSSIL" &
+                  basisOfRecord != "LIVING_SPECIMEN") %>%
+  # select what we need
+  dplyr::select(species, decimalLatitude, decimalLongitude)
+```
+
+```{r, Import from Herpmapper}
+# import hermapper results
+Eurycea.Herpmapper <- read.csv(paste0(getwd(), "/Data/Occs/Snead_Eurycea_17March2024.csv")) %>%
+  # get only the genus and species
+  dplyr::mutate(Taxon = stringr::word(Taxon, 1,2, sep=" ")) %>%
+  # seperate the date
+  tidyr::separate(Date, c("Month", "Day", "Year"), sep = "/", convert = TRUE) %>%
+  # filter
+  dplyr::filter(Year > 2000, Accuracy < 1000) %>%
+  # rename
+  dplyr::rename("decimalLatitude" = "Latitude",
+                "decimalLongitude" = "Longitude",
+                "species" = "Taxon") %>%
+  # select
+  dplyr::select(species, decimalLatitude, decimalLongitude)
+``` 
+
+```{r, import from literature search}
+# import literature search
+Eurycea.Lit <- read.csv(paste0(getwd(), "/Data/Occs/Eurcyea_Occs_Lit.csv")) %>%
+  # rename
+  dplyr::rename("decimalLatitude" = "Latitude",
+                "decimalLongitude" = "Longitude",
+                "species" = "Species") %>%
+  # convert to numeric
+  dplyr::mutate(decimalLatitude = as.numeric(decimalLatitude),
+                decimalLongitude = as.numeric(decimalLongitude),
+                trimws(species)) %>%
+  # select
+  dplyr::select(species, decimalLatitude, decimalLongitude)
+```
+
+```{r, combine data}
+# combine data sets
+Eurycea.Occs <- rbind(Eurycea.GBIF,
+                                 Eurycea.Herpmapper) %>%
+  # rbind
+  rbind(., Eurycea.Lit) %>%
+  # drop NAs
+  tidyr::drop_na(.)
+```
+## Rarefy
+
+```{r, rarefy}
+# make occurance data frame
+Occs.Rare <- split(Eurycea.Occs, Eurycea.Occs$species) %>%
+  # run the rarefication algorith
+  lapply(X = ., FUN = (function(X){
+    
+    library(dplyr)
+    
+    Table <- X %>%
+      # select what we need
+      dplyr::select(species, decimalLatitude, decimalLongitude) %>%
+      # rarefy by 5 km for 5 replicates
+      spThin::thin(., spec.col = "species", lat.col = "decimalLatitude",
+                   long.col = "decimalLongitude", thin.par = 5, write.files = FALSE,
+                   write.log.file = FALSE, reps = 1, locs.thinned.list.return = TRUE) %>%
+      # produces list so must bind
+      dplyr::bind_rows(.) %>%
+      # get species name 
+      dplyr::mutate(Species = sub(" ", "_", unique(X$species)), .before = Longitude)
+    
+    return(Table)
+  })) %>%
+  # make dataf rame
+  dplyr::bind_rows(., .id = "Species") %>%
+  # group by species
+  dplyr::group_by(Species) %>%
+  # filter
+  dplyr::filter(n() >= 30) %>%
+  #format the species names
+  dplyr::mutate(Species = stringr::str_replace(Species, " ", "_")) %>%
+  #ungroup
+  dplyr::ungroup(.) %>%
+  # filter out E. cirrigera that are impossible
+  dplyr::filter(Longitude != min(Longitude)) 
+```
+
+# Environmental Data
+
+## Elevation 
+
+```{r, download elevation}
+# Download elevation data at 1km resolution
+Elevation <- geodata::elevation_30s(country = "USA", path = paste(getwd(), "Data/Env", sep ="/")) %>%
+  # merge with elevation of canada
+  terra::merge(., (geodata::elevation_30s(country = "CANADA", path = paste(getwd(), "Data/Env", sep ="/")))) %>%
+  # # merge with mexico
+  terra::merge(., (geodata::elevation_30s(country = "MEXICO", path = paste(getwd(), "Data/Env", sep ="/")))) %>%
+  # crop
+  terra::crop(., (terra::ext(-110, -64, 24, 54)))
+```
+
+## WorldClim
+
+```{r, download chelsa}
+# load all the environmental data as tiles (labels wordclim but is chelsa)
+WorldClim <- rpaleoclim::paleoclim(period = "cur",
+                                      resolution = "30s",
+                                      region = c(-110, -64, 24, 54),
+                                      as = "terra",
+                                      skip_cache = FALSE,
+                                      cache_path = paste(getwd(), "Data/Env/CHELSA", sep = "/")) %>%
+  # resample
+  terra::resample(., Elevation, method = "cubicspline", threads = TRUE)
+
+```
+
+## Impervious surface
+```{r, Impervious surface}
+# load and format impervious surface 2010
+ImpSurf <- terra::rast(x = paste(getwd(),
+                        "Data/Env/gmis_impervious_surface_percentage_geographic_1000m.tif",
+                                 sep ="/")) %>%
+  # resample
+  terra::resample(., Elevation, method = "cubicspline", threads = TRUE)
+```
+
+## Population Density
+
+```{r, Population Density}
+# load the populdation density
+PopDensity <- geodata::population(year = 2010, res = 0.5, path = paste(getwd(), "Data/Env", sep ="/")) %>%
+  # crop
+  terra::crop(., (terra::ext(-110, -64, 24, 54)))
+```
+
+## Artifical Night Light
+
+```{r, Artifical Night Time Light}
+# process night lights
+NightLight <- list.dirs(path = paste(getwd(), "/Data/Env/Nightlight/", sep = ""), recursive = FALSE, full.names = TRUE) %>%
+  # appl the function to all the folders in the directory 
+    lapply(., FUN = function(x){
+      # get all the files
+      files <- list.files(x, recursive = FALSE, full.names = TRUE)
+      
+      # for all the folders with more than one file
+      if(length(files) > 1){
+        
+        # make a empty list
+        Data <- list()
+        
+        # for each file
+        for(i in 1:length(files)){
+          
+          # load the raster
+          Data[[i]] <- terra::rast(x = files[i]) %>%
+            # crop it
+            terra::crop(., (terra::ext(-110, -64, 24, 54)))}
+        
+        # make a spatraster dataset
+        Data <- terra::sds(Data) %>%
+          # get mean
+          terra::app(., mean)} else {
+            # if only one file load the raster
+            Data <- terra::rast(x = files) %>%
+              # crop it
+              terra::crop(., (terra::ext(-110, -64, 24, 54)))}
+      
+      # return the data
+      return(Data)}) %>%
+  # make spatraster dataset
+  terra::sds(.) %>%
+  # get mean
+  terra::app(., mean) %>%
+  # resample
+  terra::resample(., Elevation, method = "cubicspline", threads = TRUE)
+``` 
+
+## Canopy Cover
+```{r, Canopy Cover}
+# load canopy cover
+Canopycover <- list.files(path = paste(getwd(), "/Data/Env/canopycover/",
+                                       sep = ""),
+                          recursive = FALSE, full.names = TRUE) %>%
+  # load all the raster files
+  lapply(., FUN = terra::rast) %>%
+  # make mosaic
+  do.call(terra::mosaic, .) %>%
+  # crop
+  terra::crop(., (terra::ext(-110, -64, 24, 54))) %>%
+  # make NAs zero for interpolation
+  terra::subst(., NA, 0) %>%
+  # resample
+  terra::resample(., Elevation, method = "cubicspline", threads = TRUE) %>%
+  # recalssify to get rid of impossible values
+  terra::classify(., matrix(c(-5,0,0), ncol=3, byrow=TRUE))
+
+
+```
+
+## Combine Environmental Data
+
+```{r, combine environmental data}
+# combine environmental data
+Environmental.Data <- c(WorldClim,
+                        Elevation,
+                        NightLight,
+                        PopDensity,
+                        Canopycover,
+                        ImpSurf)
+```
+
+# Variables selection
+
+```{r, Extract environmental data}
+# extract environmental data
+Extracted.Envs <-  terra::extract(Environmental.Data,
+                                  # make a single occs dataframe
+                                  (Occs.Rare %>%
+                                     dplyr::select(-Species)), ID = TRUE) %>%
+  # convert to data frame
+  as.data.frame(.)
+```
+
+```{r, Variable Selection}
+
+# remove multicolinear variables
+usdm::vifstep(Extracted.Envs[,2:ncol(Extracted.Envs)], th = 5)
+```
+
+```{r, Formatting Variables}
+# rename and filter
+Environmental.Data.Filtered <- Environmental.Data %>%
+  # rename the important variables
+  tidyterra::rename(Precip_Warmest_Quarter = bio_18,
+                    Precip_Driest_M = bio_14,
+                    Temp_Seasonality = bio_4,
+                    Mean_Temp_Driest_Quarter = bio_9,
+                    Mean_Temp_Wettest_Quarter = bio_8,
+                    Mean_Diurnal_Range = bio_2,
+                    Precip_Seasonality = bio_15,
+                    Elevation = USA_elv_msk,
+                    Nightlight = F101992.v4b.avg_lights_x_pct,
+                    Population_Density = population_density,
+                    Canopy_Cover = Layer_1,
+                    Imp_Surf = gmis_impervious_surface_percentage_geographic_1000m) %>%
+  # select the variables we want
+  tidyterra::select(Precip_Warmest_Quarter, Precip_Driest_M, Temp_Seasonality, Mean_Temp_Driest_Quarter,
+                    Mean_Temp_Wettest_Quarter, Mean_Diurnal_Range, Precip_Seasonality, Elevation,
+                    Nightlight, Population_Density, Canopy_Cover, Imp_Surf) %>%
+  # synchronize NA
+  terra::mask(., terra::app(., fun = sum))
+```
+
+```{r, remove NAs from Occurances}
+# remove rows with NAs in predictors
+Occs.Rare <- Occs.Rare[-as.vector(Extracted.Envs[!complete.cases(Extracted.Envs),1]),]
+```
+
+```{r, remove rasters for space}
+rm(WorldClim,
+   Elevation,
+   NightLight,
+   PopDensity,
+   Canopycover,
+   ImpSurf,
+   Environmental.Data)
+
+```
+
+
+```{r, write environmental data}
+# write the final raster data incase R crashes
+terra::writeRaster(Environmental.Data.Filtered, paste0(getwd(),
+                                       "/Data/Env/Final_Envs.tiff"), overwrite = TRUE)
+
+# load back in raster data anytime you reopen the project
+Environmental.Data.Filtered <- terra::rast( paste0(getwd(),
+                                                   "/Data/Env/Final_Envs.tiff"))
+
+
+```
+
+# Target Group Background Points
+
+```{r, background point download}
+
+classes <- c(#"Mammalia", 
+             #"Aves", 
+             "Amphibia", 
+             "Sphenodontia",
+             "Crocodylia",
+             "Squamata",
+             "Testudines")
+
+bbox <- c(-110, -64, 24, 54)
+
+geometry <- sprintf("POLYGON((%f %f, %f %f, %f %f, %f %f, %f %f))",
+                    bbox[1], bbox[2], bbox[3], bbox[2],
+                    bbox[3], bbox[4], bbox[1], bbox[4],
+                    bbox[1], bbox[2])
+
+# Get taxonKeys for each class
+class.keys <- sapply(classes, function(class_name) {
+  rgbif::name_backbone(name = class_name, rank = "class")$usageKey
+})
+
+# Build individual predicates for each class
+taxon.preds <- do.call(rgbif::pred_or,
+                       as.list(unname(lapply(class.keys, function(key) rgbif::pred("taxonKey", key)))))
+
+# Combine predicates using OR, then add location filter
+download.key <- rgbif::occ_download(
+  taxon.preds,
+  rgbif::pred("hasCoordinate", TRUE),
+  rgbif::pred("occurrenceStatus", "PRESENT"),
+  rgbif::pred_gt("year", 2000),
+  rgbif::pred_lt("coordinateUncertaintyInMeters", 1000),
+  rgbif::pred("basisOfRecord", "HUMAN_OBSERVATION"),
+  rgbif::pred_within(geometry),
+  format = "SIMPLE_CSV"
+)
+
+# Check download status
+rgbif::occ_download_meta(download.key)
+
+# Download when it's ready
+rgbif::occ_download_get(download.key, path = "Data/", overwrite = TRUE)
+
+# Unzip and read
+unzip("Data/Background.zip", exdir = "Data/")
+
+Background.Occs <- readr::read_tsv("Data/Background.tsv") %>%
+  dplyr::select("decimalLongitude", "decimalLatitude", "species", "datasetKey") %>%
+  dplyr::rename("Longitude"="decimalLongitude",
+                "Latitude"="decimalLatitude") %>%
+  dplyr::filter(!grepl("eurycea", species, ignore.case = TRUE))
+  
+
+```
+
+```{r, background subsampling}
+# Create empty list to hold per-species results
+Tmp.BG <- list()
+
+# Loop over each salamander species in Occs.Rare
+for (sp in unique(Occs.Rare$Species)) {
+  
+  message("Processing: ", sp)
+  
+  # Get coordinates for this species from Occs.Rare
+  sp.coords <- Occs.Rare %>%
+    dplyr::filter(Species == sp) %>%
+    dplyr::select(Longitude, Latitude)
+  
+  # Skip if fewer than 3 points
+  if (nrow(sp.coords) < 3) next
+  
+  # Create terra vector from Occs.Rare points
+  sp.vect <- terra::vect(sp.coords, geom = c("Longitude", "Latitude"), crs = "EPSG:4326")
+  
+  # Convex hull and buffer
+  sp.hull <- terra::convHull(sp.vect)
+  sp.buffer <- terra::buffer(sp.hull, width = max(terra::distance(sp.vect)) / 2)
+  
+  # Convert Vertebrate_Occs to terra vector
+  Background.vect <- terra::vect(Background.Occs, geom = c("Longitude", "Latitude"), crs = "EPSG:4326")
+  
+  # Spatial subset — only vertebrate points within the buffer
+  inside <- Background.vect[sp.buffer, ]
+  
+  # Skip if no vertebrate points are inside
+  if (nrow(inside) == 0) next
+  
+  # Turn into data.frame
+  sampled <- terra::as.data.frame(inside, geom = "XY") %>%
+    rename(Longitude = x, Latitude = y) %>% 
+    select(Longitude, Latitude, species, datasetKey)
+  
+  # Extract environmental values
+  env.values <- terra::extract(Environmental.Data.Filtered, sampled[, c("Longitude", "Latitude")])
+  
+  # Combine and filter rows with complete (non-NA) data across all layers
+  sampled <- cbind(sampled, env.values) %>%
+    filter(complete.cases(.)) %>%
+    select(Longitude, Latitude, species, datasetKey)  # drop env values if not needed in output
+  
+  # If any remain, add salamander species label
+  if (nrow(sampled) > 0) {
+    sampled <- sampled %>%
+      #sample_n(min(10000, nrow(.))) %>%
+      mutate(Salamander_Species = sp)
+    } else {
+      next  # Skip species if no valid background points
+      }
+  
+  rm(inside,
+       Background.vect,
+       sp.coords,
+       sp.hull,
+       sp.buffer)
+  
+  # Add to final list
+  Tmp.BG[[sp]] <- sampled
+  
+  gc()
+}
+
+# Combine all species into one dataframe
+Background.Filtered <- Tmp.BG %>%
+  lapply(X = ., raster_layer = Environmental.Data.Filtered,
+         FUN = function(X, raster_layer) {
+  library(terra)
+    
+  pts <- terra::vect(X, geom = c("Longitude", "Latitude"), crs = "EPSG:4326")
+  
+  # Extract the cell number for each point using your raster
+  cell_ids <- terra::cellFromXY(raster_layer, terra::crds(pts))
+  
+  # Keep one point per cell
+  X_thinned <- X[!duplicated(cell_ids), ]
+  
+  return(X_thinned)
+}) %>%
+  dplyr::bind_rows(.)
+  
+
+rm(Tmp.BG)
+T <- Background.Filtered %>% dplyr::select(-Salamander_Species) %>% dplyr::distinct(.)
+
+
+```
+
+
+# Modeling
+```{r, Modeling Function}
+# function for modeling
+Modeling.Function <- function(occs, env, bg, coords = c("Longitude", "Latitude"), cores = 1, AIC.Thresh = 0.95, path = getwd()) {
+  library(tidyverse)
+  library(ENMeval)
+  library(terra)
+  library(tidyterra)
+  library(ecospat)
+  library(doParallel)
+
+  # response function for later
+  partial.response <- function(model, variables = NULL, n_points = 101) {
+  # Pull partial response curves
+  partial_list <- predicts::partialResponse(model, plot = FALSE)
+
+  # If specific variables requested
+  if (!is.null(variables)) {
+    partial_list <- partial_list[variables]
+  }
+
+  # Process each variable
+  formatted_list <- purrr::imap(partial_list, function(df, var_name) {
+    df <- as.data.frame(df)
+
+    # Force interpolation across full variable range
+    x_range <- range(df[[1]], na.rm = TRUE)
+    x_seq <- seq(x_range[1], x_range[2], length.out = n_points)
+
+    # Interpolate suitability
+    y_interp <- approx(df[[1]], df[[2]], xout = x_seq, rule = 2)$y
+
+    tibble::tibble(
+      Variable = var_name,
+      Env = x_seq,
+      Suitability = y_interp
+    )
+  })
+
+  # Return one combined data frame
+  dplyr::bind_rows(formatted_list)
+  }
+  
+  Species <- occs[1, 1]
+  occs.vec <- terra::vect(occs, geom = coords, crs = terra::crs(env))
+  occs <- occs[, 2:3]
+  bg <- bg[, 1:2]
+  colnames(bg) <- coords
+
+  FC <- if (nrow(occs) < 80) {
+    c("L", "Q", "H", "LQ", "LH", "QH", "LQH")
+  } else {
+    c("L", "Q", "H", "P", "LQ", "LH", "LP", "QH", "QP", "HP", "LQH", "LQP", "LHP", "QHP", "LQHP")
+  }
+
+  M <- terra::buffer((terra::convHull(occs.vec)), width = (max(terra::distance(occs.vec)) / 2))
+  env.bg <- terra::mask((terra::crop(env, M)), M)
+  rm(M, occs.vec); gc()
+
+ENM <- ENMeval::ENMevaluate(
+  occs = occs,
+  envs = env.bg,
+  bg = bg,
+  algorithm = 'maxent.jar',
+  partitions = "block",
+  tune.args = list(fc = FC, rm = seq(0.5, 5, by = 0.5)),
+  raster.preds = FALSE,
+  parallel = cores > 1,
+  numCores = if (cores > 1) cores else NULL
+)
+
+  rm(env.bg, occs, bg); gc()
+
+  Model.df <- stats::na.omit(ENM@results)
+  Model.df <- Model.df[order(Model.df$w.AIC, decreasing = TRUE), ]
+
+  obj_dir <- file.path(path, "Results/ENM_Models_Obj", Species)
+  proj_dir <- file.path(path, "Results/Projected_Raster")
+  m_dir <- file.path(path, "Results/M_Raster")
+  dir.create(obj_dir, recursive = TRUE, showWarnings = FALSE)
+  dir.create(proj_dir, recursive = TRUE, showWarnings = FALSE)
+  dir.create(m_dir, recursive = TRUE, showWarnings = FALSE)
+
+  if (Model.df$w.AIC[1] < AIC.Thresh) {
+    Model.df <- Model.df[1:(which.max(cumsum(Model.df$w.AIC) >= AIC.Thresh)), ]
+    Model.df <- cbind(Model = as.character(Model.df$tune.args), subset(Model.df, select = -c(tune.args, fc, rm, ncoef)))
+
+    weighted_m_paths <- c()
+    weighted_proj_paths <- c()
+    Models.Paths <- list()
+    Response.Df.Avg <- list()
+    Avg.Imp <- list()
+
+    for (i in seq_len(nrow(Model.df))) {
+      model_id <- Model.df$Model[i]
+      weight <- Model.df$w.AIC[i]
+
+      model <- ENM@models[[model_id]]
+      model_path <- file.path(obj_dir, paste0(Species, "_", model_id, ".RDS"))
+      saveRDS(model, model_path)
+      Models.Paths[[i]] <- model_path
+
+      m_path <- file.path(m_dir, paste0("Weighted_", model_id, ".tif"))
+      pred_m <- predicts::predict(model, env.bg) * weight
+      terra::writeRaster(pred_m, m_path, overwrite = TRUE)
+      weighted_m_paths <- c(weighted_m_paths, m_path)
+      rm(pred_m); gc()
+
+      proj_path <- file.path(proj_dir, paste0("Projected_", model_id, ".tif"))
+      pred_proj <- predicts::predict(model, env) * weight
+      terra::writeRaster(pred_proj, proj_path, overwrite = TRUE)
+      weighted_proj_paths <- c(weighted_proj_paths, proj_path)
+      rm(pred_proj); gc()
+
+      imp <- ENM@variable.importance[[model_id]] %>%
+        dplyr::mutate(Species = Species, Model = model_id) %>%
+        dplyr::rename(Variable = variable,
+                      Percent.Contribution = percent.contribution,
+                      Permutation.Importance = permutation.importance)
+
+      Avg.Imp[[i]] <- imp %>% dplyr::mutate(Weight = weight)
+
+      response_df <-  partial.response(model) %>%
+        dplyr::mutate(Suitability = Suitability * weight, Species = Species, Variable = as.character(Variable))
+
+      Response.Df.Avg[[i]] <- response_df %>% dplyr::select(Species, Variable, Env, Suitability)
+      rm(model, response_df, imp); gc()
+    }
+
+    Avg.M.raster <- sum(terra::rast(weighted_m_paths)) / sum(Model.df$w.AIC)
+    Avg.Project.raster <- sum(terra::rast(weighted_proj_paths)) / sum(Model.df$w.AIC)
+    terra::writeRaster(Avg.M.raster, file.path(m_dir, paste0(Species, ".tiff")), overwrite = TRUE)
+    terra::writeRaster(Avg.Project.raster, file.path(proj_dir, paste0(Species, ".tiff")), overwrite = TRUE)
+    file.remove(weighted_m_paths)
+    file.remove(weighted_proj_paths)
+
+    Response.Df.Avg <- bind_rows(Response.Df.Avg) %>%
+      dplyr::group_by(Species, Variable, Env) %>%
+      dplyr::summarize(Suitability = sum(Suitability) / sum(Model.df$w.AIC), .groups = "drop") %>%
+      dplyr::mutate(Model = "Averaged") %>%
+      dplyr::select(Species, Model, Variable, Env, Suitability)
+
+    Avg.Imp <- bind_rows(Avg.Imp) %>%
+      dplyr::mutate(Percent.Contribution = Percent.Contribution * Weight,
+                    Permutation.Importance = Permutation.Importance * Weight) %>%
+      dplyr::group_by(Species, Variable) %>%
+      dplyr::summarize(Percent.Contribution = sum(Percent.Contribution) / sum(Weight),
+                       Permutation.Importance = sum(Permutation.Importance) / sum(Weight), .groups = "drop") %>%
+      dplyr::mutate(Model = "Averaged") %>%
+      dplyr::select(Species, Model, Variable, Percent.Contribution, Permutation.Importance)
+
+    avg_row <- cbind(
+      Model = "Averaged",
+      as.data.frame(lapply(Model.df[2:13], function(x) sum(x * Model.df$w.AIC) / sum(Model.df$w.AIC))),
+      AICc = NA, delta.AICc = NA, w.AIC = NA
+    )
+    Model.df <- rbind(Model.df, avg_row)
+
+    return(list(
+      Results = Model.df,
+      Models = Models.Paths,
+      Importance = Avg.Imp,
+      Responses = Response.Df.Avg,
+      Raster.M = file.path(m_dir, paste0(Species, ".tiff")),
+      Raster.Projected = file.path(proj_dir, paste0(Species, ".tiff"))
+    ))
+
+  } else {
+    model_id <- as.character(Model.df$tune.args[1])
+    best_model <- ENM@models[[model_id]]
+    model_path <- file.path(obj_dir, paste0(Species, "_", model_id, ".RDS"))
+    saveRDS(best_model, model_path)
+
+    Project <- predicts::predict(best_model, env)
+    M.raster <- predicts::predict(best_model, env.bg)
+
+    terra::writeRaster(M.raster, file.path(m_dir, paste0(Species, ".tiff")), overwrite = TRUE)
+    terra::writeRaster(Project, file.path(proj_dir, paste0(Species, ".tiff")), overwrite = TRUE)
+
+    imp <- ENM@variable.importance[[model_id]] %>%
+      dplyr::mutate(Species = Species, Model = model_id) %>%
+      dplyr::rename(Variable = variable,
+                    Percent.Contribution = percent.contribution,
+                    Permutation.Importance = permutation.importance) %>%
+      dplyr::select(Species, Model, Variable, Percent.Contribution, Permutation.Importance)
+    
+    response_df <- partial.response(best_model) %>%
+      dplyr::mutate(Species = Species, Model = model_id) %>%
+      dplyr::select(Species, Model, Variable, Env, Suitability)
+
+    Model.df <- cbind(Model = as.character(Model.df$tune.args), subset(Model.df, select = -c(tune.args, fc, rm, ncoef)))
+
+    return(list(
+      Results = Model.df,
+      Models = model_path,
+      Importance = imp,
+      Responses = response_df,
+      Raster.M = file.path(m_dir, paste0(Species, ".tiff")),
+      Raster.Projected = file.path(proj_dir, paste0(Species, ".tiff"))
+    ))
+  }
+}
+
+```
+
+```{r, modeling}
+# here we model each species with the function separately to have better management of the storage and RAM usage. The function would work with lapply, but it often crashes R due to the high computational demand
+
+Eurycea_aquatica.ENM <- split(Occs.Rare, f = Occs.Rare$Species)$Eurycea_aquatica %>%
+  Modeling.Function(occs = ., bg = (split(Background.Filtered, 
+                                          f = Background.Filtered$Salamander_Species)$Eurycea_aquatica),
+                    env = Environmental.Data.Filtered,
+                    cores = 1, AIC.Thresh = 0.95)
+
+save.image("C:/Users/antho/Box/Professional/Research_Projects/Salamanders/Eurycea_SDM/.RData")
+closeAllConnections()
+gc()
+
+Eurycea_bislineata.ENM <- split(Occs.Rare, f = Occs.Rare$Species)$Eurycea_bislineata %>%
+  Modeling.Function(occs = ., env = Environmental.Data.Filtered,
+                    bg = (split(Background.Filtered,                                                   f = Background.Filtered$Salamander_Species)$Eurycea_bislineata),
+                    cores = 1, AIC.Thresh = 0.95)
+
+save.image("C:/Users/antho/Box/Professional/Research_Projects/Salamanders/Eurycea_SDM/.RData")
+closeAllConnections()
+gc()
+
+Eurycea_chamberlaini.ENM <- split(Occs.Rare, f = Occs.Rare$Species)$Eurycea_chamberlaini %>%
+  Modeling.Function(occs = ., env = Environmental.Data.Filtered,
+                    bg = (split(Background.Filtered, 
+                                          f = Background.Filtered$Salamander_Species)$Eurycea_chamberlaini),
+                    cores = 1, AIC.Thresh = 0.95)
+
+save.image("C:/Users/antho/Box/Professional/Research_Projects/Salamanders/Eurycea_SDM/.RData")
+closeAllConnections()
+gc()
+
+Eurycea_cirrigera.ENM <- split(Occs.Rare, f = Occs.Rare$Species)$Eurycea_cirrigera %>%
+  Modeling.Function(occs = ., env = Environmental.Data.Filtered,
+                    bg = (split(Background.Filtered, 
+                                          f = Background.Filtered$Salamander_Species)$Eurycea_cirrigera),
+                    cores = 1, AIC.Thresh = 0.95)
+
+save.image("C:/Users/antho/Box/Professional/Research_Projects/Salamanders/Eurycea_SDM/.RData")
+closeAllConnections()
+gc()
+
+Eurycea_guttolineata.ENM <- split(Occs.Rare, f = Occs.Rare$Species)$Eurycea_guttolineata %>%
+  Modeling.Function(occs = ., env = Environmental.Data.Filtered,
+                     bg = (split(Background.Filtered, 
+                                          f = Background.Filtered$Salamander_Species)$Eurycea_guttolineata),
+                    cores = 1, AIC.Thresh = 0.95)
+
+save.image("C:/Users/antho/Box/Professional/Research_Projects/Salamanders/Eurycea_SDM/.RData")
+closeAllConnections()
+gc()
+
+Eurycea_hillisi.ENM <- split(Occs.Rare, f = Occs.Rare$Species)$Eurycea_hillisi %>%
+  Modeling.Function(occs = ., env = Environmental.Data.Filtered,
+                    bg = (split(Background.Filtered, 
+                                          f = Background.Filtered$Salamander_Species)$Eurycea_hillisi),
+                    cores = 1, AIC.Thresh = 0.95)
+
+save.image("C:/Users/antho/Box/Professional/Research_Projects/Salamanders/Eurycea_SDM/.RData")
+closeAllConnections()
+gc()
+
+Eurycea_longicauda.ENM <- split(Occs.Rare, f = Occs.Rare$Species)$Eurycea_longicauda %>%
+  Modeling.Function(occs = ., env = Environmental.Data.Filtered,
+                    bg = (split(Background.Filtered, 
+                                          f = Background.Filtered$Salamander_Species)$Eurycea_longicauda),
+                    cores = 1, AIC.Thresh = 0.95)
+
+save.image("C:/Users/antho/Box/Professional/Research_Projects/Salamanders/Eurycea_SDM/.RData")
+closeAllConnections()
+gc()
+
+Eurycea_lucifuga.ENM <- split(Occs.Rare, f = Occs.Rare$Species)$Eurycea_lucifuga %>%
+  Modeling.Function(occs = ., env = Environmental.Data.Filtered,
+                    bg = (split(Background.Filtered, 
+                                          f = Background.Filtered$Salamander_Species)$Eurycea_lucifuga),
+                    cores = 1, AIC.Thresh = 0.95)
+
+save.image("C:/Users/antho/Box/Professional/Research_Projects/Salamanders/Eurycea_SDM/.RData")
+closeAllConnections()
+gc()
+
+Eurycea_multiplicata.ENM <- split(Occs.Rare, f = Occs.Rare$Species)$Eurycea_multiplicata %>%
+  Modeling.Function(occs = ., env = Environmental.Data.Filtered,
+                    bg = (split(Background.Filtered, 
+                                f = Background.Filtered$Salamander_Species)$Eurycea_multiplicata),
+                    cores = 1, AIC.Thresh = 0.95)
+
+save.image("C:/Users/antho/Box/Professional/Research_Projects/Salamanders/Eurycea_SDM/.RData")
+closeAllConnections()
+gc()
+
+Eurycea_paludicola.ENM <- split(Occs.Rare, f = Occs.Rare$Species)$Eurycea_paludicola %>%
+  Modeling.Function(occs = ., env = Environmental.Data.Filtered,
+                    bg = (split(Background.Filtered, 
+                                f = Background.Filtered$Salamander_Species)$Eurycea_paludicola),
+                    cores = 1, AIC.Thresh = 0.95)
+
+save.image("C:/Users/antho/Box/Professional/Research_Projects/Salamanders/Eurycea_SDM/.RData")
+closeAllConnections()
+gc()
+
+Eurycea_quadridigitata.ENM <- split(Occs.Rare, f = Occs.Rare$Species)$Eurycea_quadridigitata %>%
+  Modeling.Function(occs = ., env = Environmental.Data.Filtered,
+                    bg = (split(Background.Filtered, 
+                                f = Background.Filtered$Salamander_Species)$Eurycea_quadridigitata),
+                    cores = 1, AIC.Thresh = 0.95)
+
+save.image("C:/Users/antho/Box/Professional/Research_Projects/Salamanders/Eurycea_SDM/.RData")
+closeAllConnections()
+gc()
+
+Eurycea_tynerensis.ENM <- split(Occs.Rare, f = Occs.Rare$Species)$Eurycea_tynerensis %>%
+  Modeling.Function(occs = ., env = Environmental.Data.Filtered,
+                     bg = (split(Background.Filtered, 
+                                f = Background.Filtered$Salamander_Species)$Eurycea_tynerensis),
+                    cores = 1, AIC.Thresh = 0.95)
+
+save.image("C:/Users/antho/Box/Professional/Research_Projects/Salamanders/Eurycea_SDM/.RData")
+closeAllConnections()
+gc()
+
+Eurycea_wilderae.ENM <- split(Occs.Rare, f = Occs.Rare$Species)$Eurycea_wilderae %>%
+  Modeling.Function(occs = ., env = Environmental.Data.Filtered,
+                    bg = (split(Background.Filtered, 
+                                f = Background.Filtered$Salamander_Species)$Eurycea_wilderae),
+                    cores = 1, AIC.Thresh = 0.95)
+
+save.image("C:/Users/antho/Box/Professional/Research_Projects/Salamanders/Eurycea_SDM/.RData")
+closeAllConnections()
+gc()
+
+```
+
+```{r, list of results}
+ENM.list <- list(Eurycea_aquatica = Eurycea_aquatica.ENM,
+                 Eurycea_bislineata = Eurycea_bislineata.ENM,
+                 Eurycea_chamberlaini = Eurycea_chamberlaini.ENM,
+                 Eurycea_cirrigera = Eurycea_cirrigera.ENM,
+                 Eurycea_guttolineata = Eurycea_guttolineata.ENM,
+                 Eurycea_hillisi = Eurycea_hillisi.ENM,
+                 Eurycea_longicauda = Eurycea_longicauda.ENM,
+                 Eurycea_lucifuga = Eurycea_lucifuga.ENM,
+                 Eurycea_multiplicata = Eurycea_multiplicata.ENM,
+                 Eurycea_paludicola = Eurycea_paludicola.ENM,
+                 Eurycea_quadridigitata = Eurycea_quadridigitata.ENM,
+                 Eurycea_tynerensis = Eurycea_tynerensis.ENM,
+                 Eurycea_wilderae = Eurycea_wilderae.ENM)
+```
+
+# Niche overlap
+
+```{Niche overlap function}
+#calc niche overlap
+Niche.Overlap <- function(List, Raster.type = "M", bg) {
+  # Step 1: Extract rasters
+  RasterList <- lapply(List, function(x) {
+    terra::rast(x[[ifelse(Raster.type == "M", 5, 6)]])
+  })
+
+  # Step 2: Resample and clean NAs
+  RasterList <- lapply(RasterList, function(r) {
+    r <- terra::resample(r, bg, method = "cubicspline", threads = TRUE)
+    r[is.na(r)] <- 0
+    r
+  })
+
+  # Step 3: Combine
+  RasterStack <- terra::rast(RasterList)
+
+  # Step 4: Get names
+  species_names <- names(List)
+
+  # Step 5: Calculate overlap
+  D_dist <- ENMeval::calc.niche.overlap(RasterStack, overlapStat = "D")
+  I_dist <- ENMeval::calc.niche.overlap(RasterStack, overlapStat = "I")
+
+  # Step 6: Coerce to full matrices
+  D_mat <- t(as.matrix(D_dist))
+  I_mat <- as.matrix(I_dist)
+
+  # Step 7: Initialize final matrix
+  Combined <- I_mat
+  
+  Combined[upper.tri(Combined)] <- D_mat[upper.tri(D_mat)]
+  
+  diag(Combined) = 1
+   
+  class(Combined) <- "niolap"
+  return(Combined)
+}
+```
+
+```{r, calculate Niche overlap}
+# M space
+M.Overlap <- Niche.Overlap(ENM.list, Raster.type = "M", 
+                           bg = Environmental.Data.Filtered)
+
+rownames(M.Overlap) <- gsub("_", " ", rownames(M.Overlap))
+colnames(M.Overlap) <- gsub("_", " ", colnames(M.Overlap))
+
+write.csv(M.Overlap, paste0(getwd(), "/Results/M_Overlap.csv"))
+
+# P space
+P.Overlap <- Niche.Overlap(ENM.list, Raster.type = "P", 
+                           bg = Environmental.Data.Filtered)
+
+rownames(P.Overlap) <- gsub("_", " ", rownames(P.Overlap))
+colnames(P.Overlap) <- gsub("_", " ", colnames(P.Overlap))
+
+write.csv(P.Overlap, paste0(getwd(), "/Results/P_Overlap.csv"))
+```
+
+# Clean Tree
+
+```{r, get tree}
+# load in tree and generate concensus with least 
+Original.Tree <- phytools::ls.consensus(phytools::readNexus(file = paste0(getwd(), "/Data/Tree/Tree.nex")))
+
+#prune the tree
+Pruned.Tree <- ape::drop.tip(Original.Tree, Original.Tree$tip.label[-match(c("Eurycea_aquatica",
+                                                                             "Eurycea_bislineata",
+                                                                             "Eurycea_chamberlaini",
+                                                                             "Eurycea_cirrigera",
+                                                                             "Eurycea_guttolineata",
+                                                                             "Eurycea_longicauda",
+                                                                             "Eurycea_lucifuga",
+                                                                             "Eurycea_multiplicata",
+                                                                             "Eurycea_paludicola",
+                                                                             "Eurycea_quadridigitata",
+                                                                             "Eurycea_tynerensis_M",
+                                                                             "Eurycea_wilderae"),
+                                                                           Original.Tree$tip.label)])
+
+# rename a tip
+Pruned.Tree$tip.label[Pruned.Tree$tip.label=="Eurycea_tynerensis_M"] <- "Eurycea_tynerensis"
+
+# bind hillisi to the midpoint along the quadridigitata branch
+Binded.Tree <- phytools::bind.tip(Pruned.Tree, "Eurycea_hillisi", where = 9,
+                                  position = 16.514078/2, edge.length = 16.514078/2)
+
+Binded.Tree$tip.label <- gsub("_", " ", Binded.Tree$tip.label)
+
+Binded.Tree$node.label <- NULL
+
+# get phylogenetic covariance matrix for later on
+Phylo.vcv <- phytools::vcvPhylo(ape::ladderize(Binded.Tree), corr = TRUE)
+```
+
+
+# Response Comparision
+
+## Helper functions
+
+```{r, response comparision function}
+Compare.Responses.Function <- function(Responses.List, Adjust = FALSE, Smooth = FALSE){
+  Predictors <- list()
+  Data <- list()
+  Results <- list()
+  for(i in 1:length(Responses.List)){
+    Results[[i]] <- list()
+    # get columns we need
+    Predictors[[i]] <- Responses.List[[i]][,c(1,4)]
+    # get columns we need
+    Data[[i]] <- Responses.List[[i]][,c(1,3)]
+    # add unique identifier
+    Predictors[[i]]$row_id <- seq_len(nrow(Predictors[[i]]))
+    # add unique identifier
+    Data[[i]]$row_id <- seq_len(nrow(Data[[i]]))
+    Predictors[[i]] <- tidyr::pivot_wider(Predictors[[i]],
+                                          id_cols = row_id,
+                                          names_from = Species,
+                                          values_from = Suitability)
+    Data[[i]] <- tidyr::pivot_wider(Data[[i]],
+                                          id_cols = row_id,
+                                          names_from = Species,
+                                          values_from = Env)
+    Predictors[[i]] <- Predictors[[i]][,-1]
+    Data[[i]] <- Data[[i]][,-1]
+    Predictors[[i]] <- apply(Predictors[[i]], 2, function(x) x[!is.na(x)])
+    Data[[i]] <- apply(Data[[i]], 2, function(x) x[!is.na(x)])
+    
+    if(!is.list(Predictors[[i]])){
+      Predictors[[i]] <- as.data.frame(Predictors[[i]])
+      Data[[i]] <- as.data.frame(Data[[i]])
+    }else{
+      max_length <- max(sapply(Predictors[[i]], length))
+      Predictors[[i]] <- lapply(Predictors[[i]], function(vec) {
+        length(vec) <- max_length
+        vec
+        })
+      Data[[i]] <- lapply(Data[[i]], function(vec) {
+        length(vec) <- max_length
+        vec
+        })
+      Predictors[[i]] <- as.data.frame(do.call(cbind, Predictors[[i]]))
+      Data[[i]] <- as.data.frame(do.call(cbind, Data[[i]]))
+    }
+    Comparisions <- as.data.frame(t(combn(c(1:ncol(Predictors[[i]])), 2)))
+    for(z in 1:nrow(Comparisions)){
+      Length <- min(c(length(na.omit(as.vector(Predictors[[i]][,Comparisions[z,1]]))),
+                      length(na.omit(as.vector(Predictors[[i]][,Comparisions[z,2]])))))
+      Predictors.df <- Predictors[[i]][c(1:Length),c(Comparisions[z,1], Comparisions[z, 2])]
+      Data.df <- Data[[i]][c(1:Length),c(Comparisions[z,1], Comparisions[z,2])]
+      Results[[i]][[z]] <- enmSdmX::compareResponse(pred1 = Predictors.df[,1],
+                                                    pred2 = Predictors.df[,2],
+                                                    Data.df,
+                                                     adjust = Adjust)
+      Results[[i]][[z]]$Species_1 <- Results[[i]][[z]][1,1]
+      Results[[i]][[z]]$Species_2 <- Results[[i]][[z]][2,1]
+      Results[[i]][[z]] <- Results[[i]][[z]][,-1]
+      }
+    Results[[i]] <- do.call(rbind, Results[[i]])
+    Results[[i]] <- Results[[i]][c(ncol(Results[[i]])-1, ncol(Results[[i]]),
+                                   1:(ncol(Results[[i]])-2))]
+    rownames(Results[[i]]) <- NULL
+    Results[[i]] <- data.frame(lapply(Results[[i]], 
+                                      function(x) if (is.numeric(x)) round(x, 8) else x))
+    Results[[i]] <- unique(Results[[i]])
+  }
+  names(Results) <- names(Responses.List)
+  Results <- lapply(names(Results), function(name){
+    df <- Results[[name]]
+    df$Variable <- name
+    return(df)})
+  Results <- do.call(rbind, Results)
+  return(Results)
+}
+```
+
+```{r, make overlap list function}
+make.overlap.list <- function(
+  df,
+  tree,                          # ape::phylo
+  value_col    = "d",            # numeric pairwise value; may be "i" or "d"
+  sp1_col      = "Species_1",
+  sp2_col      = "Species_2",
+  var_col      = "Variable",
+  class_col    = "Classification",
+  diag_value   = 1,
+  agg_fun      = base::mean,     # combine duplicate pairs
+  require_full = TRUE,
+  verbose      = TRUE
+){
+  ## --- checks
+  need <- c(sp1_col, sp2_col, var_col, class_col, value_col)
+  miss <- setdiff(need, names(df))
+  if (length(miss)) stop("Input df is missing: ", paste(miss, collapse = ", "))
+  if (!inherits(tree, "phylo")) stop("'tree' must be an ape::phylo object.")
+
+  ## --- ensure numeric 'value_col' (handles factor/char)
+  x <- df[[value_col]]
+  if (is.factor(x)) x <- as.character(x)
+  if (is.character(x)) {
+    x <- trimws(x)
+    x <- sub(",", ".", x, fixed = TRUE)
+  }
+  x_num <- suppressWarnings(as.numeric(x))
+  bad <- which(is.na(x_num) & !is.na(df[[value_col]]))
+  if (length(bad)) {
+    stop("Column '", value_col, "' contains non-numeric values. Examples: ",
+         paste(utils::head(unique(df[[value_col]][bad]), 5), collapse = ", "))
+  }
+  df[[value_col]] <- x_num
+
+  ## --- clean & restrict to tree species
+  df <- df[!is.na(df[[class_col]]) & !is.na(df[[value_col]]), , drop = FALSE]
+  df[[sp1_col]] <- as.character(df[[sp1_col]])
+  df[[sp2_col]] <- as.character(df[[sp2_col]])
+
+  species <- sort(tree$tip.label)
+  df <- df[df[[sp1_col]] %in% species & df[[sp2_col]] %in% species, , drop = FALSE]
+  if (nrow(df) == 0L) stop("No rows remain after filtering to tree species.")
+
+  ## --- collapse duplicates by unordered pair within each Variable
+  #  Use .i/.j to avoid name collisions with value_col (e.g., "i")
+  i_min <- pmin(df[[sp1_col]], df[[sp2_col]])
+  j_max <- pmax(df[[sp1_col]], df[[sp2_col]])
+  agg <- stats::aggregate(
+    df[[value_col]],
+    by = list(Variable = df[[var_col]], .i = i_min, .j = j_max),
+    FUN = agg_fun
+  )
+  names(agg)[4] <- value_col  # keep your numeric column with its real name
+
+  vars <- sort(unique(agg$Variable))
+  n    <- length(species)
+
+  if (isTRUE(verbose)) {
+    cat("\n[make.overlap.list]\n")
+    cat("Species:", n, " | Variables:", length(vars), "\n")
+  }
+
+  ## --- helper to build one symmetric block (numeric-safe)
+  build_block <- function(v){
+    sub <- agg[agg$Variable == v, , drop = FALSE]
+
+    M <- matrix(NA_real_, n, n, dimnames = list(species, species))
+    storage.mode(M) <- "double"
+
+    ii <- match(sub$.i, species)
+    jj <- match(sub$.j, species)
+    if (anyNA(ii) || anyNA(jj)) {
+      badsp <- unique(c(sub$.i[is.na(ii)], sub$.j[is.na(jj)]))
+      stop("Variable '", v, "' references species not in tree: ",
+           paste(badsp, collapse = ", "))
+    }
+
+    vals <- as.numeric(sub[[value_col]])  # <- now guaranteed not to collide
+    M[cbind(ii, jj)] <- vals
+
+    Mt <- t(M)
+    copy_from_t <- is.na(M)  & !is.na(Mt)
+    copy_to_t   <- !is.na(M) &  is.na(Mt)
+    both        <- !is.na(M) &  !is.na(Mt)
+
+    M[copy_from_t] <- Mt[copy_from_t]
+    Mt[copy_to_t]  <- M[copy_to_t]
+    if (any(both)) M[both] <- (M[both] + Mt[both]) / 2
+
+    diag(M) <- as.numeric(diag_value)
+
+    if (isTRUE(require_full) && anyNA(M)) {
+      miss <- which(is.na(M) & upper.tri(M), arr.ind = TRUE)
+      ex <- if (nrow(miss)) paste0(rownames(M)[miss[1,1]], "–", colnames(M)[miss[1,2]]) else "unknown"
+      stop("Variable '", v, "' has missing pair(s) after symmetrizing (e.g., ", ex,
+           "). Set require_full = FALSE to allow NAs.")
+    }
+    M
+  }
+
+  OL <- setNames(lapply(vars, build_block), vars)
+
+  ## --- attach Variable -> Category map
+  vm <- unique(df[, c(var_col, class_col)])
+  class_map <- stats::setNames(vm[[class_col]], vm[[var_col]])
+  attr(OL, "Classification") <- class_map
+
+  if (isTRUE(verbose)) {
+    cats <- unname(class_map[vars])
+    cat("Categories:", paste(unique(cats), collapse = ", "), "\n")
+    nas <- vapply(OL, function(M) anyNA(M), logical(1))
+    if (any(nas)) cat("Matrices with NA:", paste(names(OL)[nas], collapse = ", "), "\n")
+  }
+
+  OL
+}
+```
+
+```{r, kernel pcoa}
+run.kernel.pgls <- function(
+  OL,                   # named list of species x species matrices (per Variable)
+  tree,                 # ape::phylo
+  kmax      = 50,
+  k_mode    = c("cumvar","grid"),
+  cumvar    = 0.90,
+  k_grid    = NULL,
+  iter      = 9999,
+  seed      = 123,
+  pairwise  = TRUE,
+  verbose   = TRUE,
+  .global_Y_name = ".Ytmp_kernel_rrpp"  # global LHS (matrix) name
+){
+  k_mode <- match.arg(k_mode)
+
+  ## deps
+  for (pkg in c("Matrix","ape","RRPP")) {
+    if (!requireNamespace(pkg, quietly = TRUE))
+      stop("Package '", pkg, "' is required.")
+  }
+
+  ## inputs / mapping checks
+  if (!inherits(tree, "phylo")) stop("'tree' must be an ape::phylo object.")
+  class_map <- attr(OL, "Classification")
+  if (is.null(class_map)) stop("attr(OL,'Classification') is missing.")
+  if (anyNA(class_map))  stop("Classification map contains NA values.")
+
+  species <- sort(tree$tip.label)
+  vars_ol <- names(OL)
+  if (is.null(vars_ol) || !length(vars_ol)) stop("OL must be a named list with variables as names.")
+  missing_in_map <- setdiff(vars_ol, names(class_map))
+  if (length(missing_in_map))
+    stop("Variables missing from Classification map: ", paste(missing_in_map, collapse = ", "))
+
+  ## observation IDs & phylo Cov
+  row_ids <- unlist(lapply(vars_ol, function(v) paste(v, species, sep="|")))
+  P <- ape::vcv(tree, corr = TRUE)
+  if (!all(species %in% rownames(P))) stop("Some tree tips missing from ape::vcv rownames.")
+  Cov.big <- as.matrix(Matrix::bdiag(
+    replicate(length(vars_ol), P[species, species, drop=FALSE], simplify = FALSE)
+  ))
+  dimnames(Cov.big) <- list(row_ids, row_ids)
+
+  ## per-variable blocks (symmetrize, diag=1, same order)
+  prep_block <- function(M, sp){
+    M <- as.matrix(M)
+    M <- M[sp, sp, drop = FALSE]
+    M <- (M + t(M))/2
+    diag(M) <- 1
+    M
+  }
+  K_blocks <- lapply(vars_ol, function(v) prep_block(OL[[v]], species))
+  names(K_blocks) <- vars_ol
+
+  ## big kernel + global double-centering
+  K  <- as.matrix(Matrix::bdiag(K_blocks))
+  N  <- length(row_ids)
+  J  <- diag(N) - matrix(1/N, N, N)
+  Kc <- J %*% K %*% J
+  Kc <- (Kc + t(Kc))/2
+
+  ## eigen + choose k
+  ev  <- eigen(Kc, symmetric = TRUE)
+  pos <- which(ev$values > 0)
+  if (length(pos) < 2L) stop("Insufficient positive eigenvalues after centering.")
+  vals.pos <- ev$values[pos]
+  scores.full <- ev$vectors[, pos, drop = FALSE] %*%
+    diag(sqrt(vals.pos), nrow = length(vals.pos))
+  colnames(scores.full) <- paste0("PC", seq_len(ncol(scores.full)))
+  rownames(scores.full) <- row_ids
+
+  cum   <- cumsum(vals.pos) / sum(vals.pos)
+  k_cap <- min(kmax, length(pos))
+  if (k_mode == "cumvar") {
+    k_cand <- which(cum >= cumvar)[1]; if (is.na(k_cand)) k_cand <- length(cum)
+    k <- min(k_cand, k_cap)
+    k_table <- data.frame(k = seq_len(k_cap), cumvar = cum[seq_len(k_cap)])
+  } else {
+    if (is.null(k_grid)) k_grid <- seq_len(k_cap)
+    k_grid <- k_grid[k_grid >= 1 & k_grid <= k_cap]
+    if (!length(k_grid)) stop("k_grid has no valid values within 1..", k_cap)
+    k <- max(k_grid)
+    k_table <- data.frame(k = k_grid, cumvar = cum[k_grid])
+  }
+  if (isTRUE(verbose)) {
+    cat(sprintf("\n--- k selection ---\nk.cap: %d \nk chosen:%d  (cumvar=%.4f)\n",
+                k_cap, k, cum[k]))
+  }
+
+  ## DESIGN: predictors only in data.frame; response kept separate
+  Z_all <- data.frame(
+    Species  = factor(rep(species, times = length(vars_ol)), levels = species),
+    Variable = factor(rep(vars_ol,  each  = length(species)), levels = vars_ol),
+    row.names   = row_ids,
+    check.names = FALSE
+  )
+  Z_all$Category <- factor(
+    unname(class_map[as.character(Z_all$Variable)]),
+    levels = unique(unname(class_map[vars_ol]))
+  )
+  if (anyNA(Z_all$Category)) {
+    bad <- unique(as.character(Z_all$Variable[is.na(Z_all$Category)]))
+    stop("NA in Category; missing mapping for variables: ", paste(bad, collapse = ", "))
+  }
+
+  ## Response matrix (multivariate) – assign to GLOBAL to mimic interactive behavior
+  pcs_keep <- paste0("PC", seq_len(k))
+  Ymat <- as.matrix(scores.full[, pcs_keep, drop = FALSE])
+  stopifnot(identical(rownames(Ymat), rownames(Z_all)))
+  assign(.global_Y_name, Ymat, envir = .GlobalEnv)
+  on.exit(try(remove(list = .global_Y_name, envir = .GlobalEnv), silent = TRUE), add = TRUE)
+
+  ## Build RHS-only formula and precompute model frame
+  fm_rhs <- stats::as.formula("~ Category + Species")
+  mf     <- stats::model.frame(fm_rhs, data = Z_all, na.action = stats::na.fail)
+  kept   <- rownames(mf)
+
+  ## Subset predictors, Cov, and the GLOBAL Y to the exact same rows
+  Z_sub    <- Z_all[kept, , drop = FALSE]
+  Cov_sub  <- Cov.big[kept, kept, drop = FALSE]
+  Y_global <- get(.global_Y_name, envir = .GlobalEnv)
+  Y_sub    <- Y_global[kept, , drop = FALSE]
+  # reassign the subset back to global so LHS matches rows used by RRPP
+  assign(.global_Y_name, Y_sub, envir = .GlobalEnv)
+
+  ## FINAL identity check
+  if (!identical(rownames(Z_sub), rownames(Cov_sub)) ||
+      !identical(rownames(Z_sub), rownames(Y_sub))) {
+    stop("Rowname mismatch after alignment.\n",
+         "ex in data not in Cov: ",
+         paste(utils::head(setdiff(rownames(Z_sub), rownames(Cov_sub)), 5), collapse = ", "),
+         "\nex in Cov not in data: ",
+         paste(utils::head(setdiff(rownames(Cov_sub), rownames(Z_sub)), 5), collapse = ", "),
+         "\nex in Y not in data: ",
+         paste(utils::head(setdiff(rownames(Y_sub), rownames(Z_sub)), 5), collapse = ", "))
+  }
+
+  ## Fit with matrix LHS in GLOBAL (exactly like your working interactive run)
+  options(contrasts = c("contr.sum","contr.poly"))
+  set.seed(seed)
+  fm_full <- stats::as.formula(paste0(.global_Y_name, " ~ Category + Species"))
+
+  fit <- RRPP::lm.rrpp(
+    fm_full,
+    data    = Z_sub,
+    Cov     = Cov_sub,
+    iter    = iter,
+    SS.type = "III"
+  )
+  aov_tab <- anova(fit, effect.type = "F")
+
+  ## Pairwise (optional)
+  pw_sum <- NULL
+  if (isTRUE(pairwise)) {
+    pw_sum <- try({
+      pw <- RRPP::pairwise(fit, groups = model.frame(fit)$Category)
+      summary(pw, confidence = 0.95, test.type = "dist")
+    }, silent = TRUE)
+    if (inherits(pw_sum, "try-error")) pw_sum <- NULL
+  }
+
+  if (isTRUE(verbose)) {
+    cat("\n--- ANOVA (Category row) ---\n")
+    print(aov_tab$table[rownames(aov_tab$table) == "Category", , drop = FALSE])
+  }
+
+  ## return
+  list(
+    inputs = list(
+      species   = species,
+      vars      = vars_ol,
+      kmax      = kmax,
+      k_mode    = k_mode,
+      cumvar    = cumvar,
+      k_grid    = if (k_mode == "grid") k_grid else NULL,
+      iter      = iter,
+      seed      = seed
+    ),
+    kernel = list(
+      K   = K,
+      Kc  = Kc,
+      eig = list(values.pos = vals.pos, cumvar = cum, k_cap = k_cap),
+      scores = scores.full
+    ),
+    data = list(Z_all = Z_all, Z_used = Z_sub),
+    cov  = list(P = P, Cov.big = Cov.big, Cov.used = Cov_sub),
+    k_selection = list(k = k, table = k_table),
+    fit  = list(rrpp = fit, anova = aov_tab, pairwise = pw_sum)
+  )
+}
+```
+
+
+## Unadjusted
+
+```{r, Compare Responses}
+Compare.Responses.Unadjust<- Compare.Responses.Function(Response.list, Adjust = FALSE) %>%
+  dplyr::mutate(Classification = dplyr::case_when(grepl("°C", Variable) ~ "Temperature",
+                                                   grepl("Temp", Variable) ~ "Temperature",
+                                                  grepl("Precip", Variable) ~ "Precipitation",
+                                                  Variable %in% c("Impervious Surface (%)",
+                                                                  "Canopy Cover (%)",
+                                                                  "Light at Night (nW/cm2/sr)",
+                                                                  "Population Density") ~ "Urbanization")) 
+```
+
+```{r, Responses df}
+Unadjusted.df <- Compare.Responses.Unadjust %>%
+  dplyr::select(Species_1, Species_2, i, d, Classification) %>%
+  dplyr::mutate(Classification = as.factor(Classification),
+                Species_1 = as.factor(Species_1),
+                Species_2 = as.factor(Species_2))%>%
+  dplyr::filter(!is.na(Classification))
+
+Unadjusted.df$PhyloDist <- mapply(function(s1, s2) ape::cophenetic.phylo(Binded.Tree)[s1, s2],
+                                  Unadjusted.df$Species_1,
+                                  Unadjusted.df$Species_2)
+
+aggregate(d ~ Classification, data = Unadjusted.df, FUN = mean)
+
+aggregate(i ~ Classification, data = Unadjusted.df, FUN = mean)
+```
+
+
+```{r, overlap list }
+Compare.Responses.Unadjust.D.List <- make.overlap.list(
+  df = (Compare.Responses.Unadjust %>%
+    dplyr::filter(!is.na(Classification))),
+  tree = Binded.Tree,
+  value_col = "d",
+  require_full = TRUE,   # set FALSE if some variables lack complete species coverage
+  verbose = TRUE
+)
+```
+
+```{r, model fit undajusted D}
+Unadjusted.D.res <- run.kernel.pgls(
+  OL       = Compare.Responses.Unadjust.D.List,
+  tree     = Binded.Tree,
+  kmax     = 50,
+  k_mode   = "cumvar",
+  cumvar   = 0.90,
+  iter     = 9999,
+  seed     = 42,
+  pairwise = TRUE,
+  verbose  = TRUE
+)
+```
+
+```{r, overlap list I }
+Compare.Responses.Unadjust.I.List <- make.overlap.list(
+  df =  (Compare.Responses.Unadjust %>%
+    dplyr::filter(!is.na(Classification))),
+  tree = Binded.Tree,
+  value_col = "i",
+  require_full = TRUE,   # set FALSE if some variables lack complete species coverage
+  verbose = TRUE
+)
+```
+
+```{r, modelf fit undajusted D}
+Unadjusted.I.res <- run.kernel.pgls(
+  OL       = Compare.Responses.Unadjust.I.List,
+  tree     = Binded.Tree,
+  kmax     = 50,
+  k_mode   = "cumvar",
+  cumvar   = 0.90,
+  iter     = 9999,
+  seed     = 42,
+  pairwise = TRUE,
+  verbose  = TRUE
+)
+```
+
+## Adjusted
+
+```{r, Compare Responses}
+Compare.Responses.Adjust<- Compare.Responses.Function(Response.list, Adjust = TRUE) %>%
+  dplyr::mutate(Classification = dplyr::case_when(grepl("°C", Variable) ~ "Temperature",
+                                                   grepl("Temp", Variable) ~ "Temperature",
+                                                  grepl("Precip", Variable) ~ "Precipitation",
+                                                  Variable %in% c("Impervious Surface (%)",
+                                                                  "Canopy Cover (%)",
+                                                                  "Light at Night (nW/cm2/sr)",
+                                                                  "Population Density") ~ "Urbanization")) 
+```
+
+```{r, Responses df}
+Adjusted.df <- Compare.Responses.Adjust %>%
+  dplyr::select(Species_1, Species_2, i, d, Classification) %>%
+  dplyr::mutate(Classification = as.factor(Classification),
+                Species_1 = as.factor(Species_1),
+                Species_2 = as.factor(Species_2))%>%
+  dplyr::filter(!is.na(Classification))
+
+Unadjusted.df$PhyloDist <- mapply(function(s1, s2) ape::cophenetic.phylo(Binded.Tree)[s1, s2],
+                                  Unadjusted.df$Species_1,
+                                  Unadjusted.df$Species_2)
+
+aggregate(d ~ Classification, data = Adjusted.df, FUN = mean)
+
+aggregate(i ~ Classification, data = Adjusted.df, FUN = mean)
+
+```
+
+
+```{r, overlap list }
+Compare.Responses.Adjust.D.List <- make.overlap.list(
+  df = (Compare.Responses.Adjust %>%
+    dplyr::filter(!is.na(Classification))),
+  tree = Binded.Tree,
+  value_col = "d",
+  require_full = TRUE,   # set FALSE if some variables lack complete species coverage
+  verbose = TRUE
+)
+```
+
+```{r, modelf fit undajusted D}
+Adjusted.D.res <- run.kernel.pgls(
+  OL       = Compare.Responses.Adjust.D.List,
+  tree     = Binded.Tree,
+  kmax     = 50,
+  k_mode   = "cumvar",
+  cumvar   = 0.90,
+  iter     = 9999,
+  seed     = 42,
+  pairwise = TRUE,
+  verbose  = TRUE
+)
+```
+
+```{r, overlap list I }
+Compare.Responses.Adjust.I.List <- make.overlap.list(
+  df =  (Compare.Responses.Adjust %>%
+    dplyr::filter(!is.na(Classification))),
+  tree = Binded.Tree,
+  value_col = "i",
+  require_full = TRUE,   # set FALSE if some variables lack complete species coverage
+  verbose = TRUE
+)
+```
+
+```{r, modelf fit undajusted D}
+Adjusted.I.res <- run.kernel.pgls(
+  OL       = Compare.Responses.Adjust.I.List,
+  tree     = Binded.Tree,
+  kmax     = 50,
+  k_mode   = "cumvar",
+  cumvar   = 0.90,
+  iter     = 9999,
+  seed     = 42,
+  pairwise = TRUE,
+  verbose  = TRUE
+)
+
+```
+
+# GAM R2 Importance
+```{r, importance function}
+ecological.importance.fun <- function(species.list, env, max.points = 1000000, seed = 42) {
+  library(terra)
+  library(mgcv)
+
+  ecological.importance.gam.hp <- function(pred.path, env, max.points = 10000, seed = 42) {
+    pred.raster <- rast(pred.path)
+    names(pred.raster) <- "Suitability"
+    
+    env.crop <- crop(env, pred.raster)
+    env.masked <- mask(env.crop, pred.raster)
+    
+    full.stack <- c(pred.raster, env.masked)
+    data.df <- as.data.frame(full.stack, na.rm = TRUE)
+    
+    set.seed(seed)
+    if (nrow(data.df) > max.points) {
+      data.df <- data.df[sample(1:nrow(data.df), max.points), ]
+    }
+    
+    var.names <- names(env.masked)
+    
+    gam.formula <- as.formula(
+      paste("Suitability ~", paste0("s(", var.names, ")", collapse = " + "))
+    )
+    
+    gam.fit <- gam(gam.formula, data = data.df, method = "REML")
+    full.r2 <- summary(gam.fit)$r.sq
+    
+    var.importance <- sapply(var.names, function(v) {
+      drop.vars <- setdiff(var.names, v)
+      reduced.formula <- as.formula(
+        paste("Suitability ~", paste0("s(", drop.vars, ")", collapse = " + "))
+      )
+      reduced.fit <- gam(reduced.formula, data = data.df, method = "REML")
+      reduced.r2 <- summary(reduced.fit)$r.sq
+      full.r2 - reduced.r2
+    })
+    
+    var.importance.percent <- 100 * var.importance / sum(var.importance)
+    
+    list(
+      gam.fit = gam.fit,
+      predictions = predict(gam.fit, newdata = data.df),
+      variable.importance = sort(var.importance.percent, decreasing = TRUE)
+    )
+  }
+
+  results.list <- list()
+
+  for (i in seq_along(species.list)) {
+    species.name <- names(species.list)[i]
+    suitability.path <- species.list[[i]][[5]]
+    
+    cat("▶ Processing:", species.name, "\n")
+    
+    if (!file.exists(suitability.path)) {
+      cat("❌ File not found:", suitability.path, "\n")
+      next
+    }
+
+    result <- ecological.importance.gam.hp(suitability.path, env, max.points, seed)
+    results.list[[species.name]] <- list(
+      name = species.name,
+      importance = result$variable.importance,
+      full = result
+    )
+    
+    cat("✅ Finished:", species.name, "with", length(result$variable.importance), "variables\n")
+  }
+
+  # Extract and structure output
+  importance.results <- setNames(lapply(results.list, function(x) x$importance), names(results.list))
+  all.outputs <- setNames(lapply(results.list, function(x) x$full), names(results.list))
+
+  # Long-format importance dataframe
+  Importance.Model.df <- do.call(rbind, lapply(names(importance.results), function(species) {
+    data.frame(
+      Species = gsub("_", " ", species),
+      Variable = names(importance.results[[species]]),
+      Importance = as.numeric(importance.results[[species]])
+    )
+  }))
+
+  return(list(
+    Importance.Model.df = Importance.Model.df,
+    All.Results = all.outputs
+  ))
+}
+```
+
+```{r, ecological importance}
+Eco.Var.Importance <- ecological.importance.fun(ENM.list, env = Environmental.Data.Filtered)
+```
+
+```{r, ecological importance formating}
+Eco.Var.Importance$Importance.Model.df <- Eco.Var.Importance$Importance.Model.df %>%
+  dplyr::mutate(Variable = dplyr::case_when(
+    Variable == "Canopy_Cover" ~ "Canopy Cover (%)",
+    Variable == "Elevation" ~ "Elevation (m)",
+    Variable == "Imp_Surf" ~ "Impervious Surface (%)",
+    Variable == "Mean_Diurnal_Range" ~ "Mean Diurnal Range (°C)",
+    Variable == "Mean_Temp_Driest_Quarter" ~ "Mean Temperature of the Driest Quarter (°C)",
+    Variable == "Mean_Temp_Wettest_Quarter" ~ "Mean Temperature of the Wettest Quarter (°C)",
+    Variable == "Nightlight" ~ "Light at Night (nW/cm2/sr)",
+    Variable == "Population_Density" ~ "Population Density",
+    Variable == "Precip_Driest_M" ~ "Precipitation of the Driest Month (mm)",
+    Variable == "Precip_Seasonality" ~ "Precipitation Seasonality",
+    Variable == "Precip_Warmest_Quarter" ~ "Precipitation of the Warmest Quarter (mm)",
+    Variable == "Temp_Seasonality" ~ "Temperature Seasonality"),
+    Species = sub("_", " ", Species)) %>%
+  tidyr::drop_na(.) %>%
+  dplyr::mutate(Classification = dplyr::case_when(grepl("°C", Variable) ~ "Temperature",
+                                                  grepl("Temp", Variable) ~ "Temperature",
+                                                  grepl("Precip", Variable) ~ "Precipitation",
+                                                  Variable %in% c("Impervious Surface (%)",
+                                                                  "Canopy Cover (%)",
+                                                                  "Light at Night (nW/cm2/sr)",
+                                                                  "Population Density") ~ "Urbanization"))
+```
+
+```{r, pglmm}
+
+Eco.Var.pglmm.df <- na.omit(Eco.Var.Importance$Importance.Model.df) %>%
+  dplyr::mutate(Classification = factor(Classification, levels = c("Urbanization",
+                                                                   "Temperature",
+                                                                   "Precipitation")),
+                Species = as.factor(Species))
+
+Eco.Var.pglmm.df$Classification <- relevel(
+  factor(Eco.Var.pglmm.df$Classification, 
+         levels = c("Urbanization", "Temperature", "Precipitation")),
+  ref = "Urbanization"
+)
+
+contrasts(Eco.Var.pglmm.df$Classification) <- contr.treatment(3)
+
+Phylo.cor <- ape::vcv(Binded.Tree, corr = TRUE)
+
+Eco.Var.pglmm.res <- pglmm(
+  Importance ~ Classification + (1 | Species__),
+  data      = Eco.Var.pglmm.df,
+  cov_ranef = list(Species = Phylo.cor),
+  family    = "gaussian",
+  REML      = TRUE
+)
+
+summary(Eco.Var.pglmm.res)
+
+Lm.equiv <- lm(Importance ~ Classification, data = Eco.Var.pglmm.df)
+emm.ecovar <- emmeans(Lm.equiv, ~ Classification)
+pairs(emm.ecovar)
+
+aggregate(Importance ~ Classification, Eco.Var.pglmm.df, mean)
+```
+
+
+```{r, Imp summaries}
+summary(Eco.Importance.fit)
+
+Eco.Importance.cond <- brms::conditional_effects(Eco.Importance.fit, effects = "Classification")
+
+Eco.Importance.fixed <- brms::fixef(Eco.Importance.fit)
+
+emmeans::emmeans(Eco.Importance.fit, pairwise ~ Classification)
+
+brms::VarCorr(Eco.Importance.fit)
+
+brms::pp_check(Eco.Importance.fit, ndraw = 100)
+
+```
+
+## Phylogenetic Signal GAM R2 Importance
+```{r, eco importance fit}
+fit.models<-function(trait, tree){
+
+	# define set of models to compare
+	models=c("BM", "OU", "EB", "white", "rate_trend", "lambda",
+	         "kappa","delta", "mean_trend")
+	summaries=c("diffusion", "Ornstein-Uhlenbeck", "early burst", "white noise", "rate trend",
+	            "lambda", "speciation", "time-dependent", "mean trend")
+
+	## ESTIMATING measurement error ##
+	aic.se=numeric(length(models))
+	lnl.se=numeric(length(models))
+
+	for(m in 1:length(models)){
+		cat("\n\n\n\n\t*** ", paste(toupper(summaries[m]),": fitting ", sep=""), models[m],
+			" with SE *** \n", sep="")
+		tmp=geiger::fitContinuous(tree,trait,SE=NA, model=models[m],
+                                    bounds=list(SE=c(0,1)), control = list(niter = 999),
+		                          ncores=2)
+		print(tmp)
+		aic.se[m]=tmp$opt$aicc
+		lnl.se[m]=tmp$opt$lnL
+	}
+
+
+	## ASSUMING no measurement error ##
+	aic=numeric(length(models))
+	lnl=numeric(length(models))
+
+	for(m in 1:length(models)){
+		cat("\n\n\n\n\t*** ", paste(toupper(summaries[m]),": fitting for ", sep=""), models[m],
+			 " *** \n", sep="")
+		tmp=geiger::fitContinuous(tree,trait, SE=0,model=models[m], control = list(niter = 999),
+		                          ncores=2)
+		print(tmp)
+		aic[m]=tmp$opt$aicc
+		lnl[m]=tmp$opt$lnL
+	}
+
+	## COMPARE AIC ##
+	names(aic.se)<-names(lnl.se)<-names(aic)<-names(lnl)<-models
+	delta_aic<-function(x) x-x[which(x==min(x))]
+
+	# no measurement error
+	daic=delta_aic(aic)
+	cat("\n\n\n\t\t\t\t*** MODEL COMPARISON: ",trait," *** \n",sep="")
+	cat("\tdelta-AIC values for models assuming no measurement error
+    \t\t\t\t zero indicates the best model\n\n")
+	print(daic, digits=2)
+
+		# measurement error
+	daic.se=delta_aic(aic.se)
+	cat("\n\n\n\n\t\t\t\t*** MODEL COMPARISON: ",trait," ***\n",sep="")
+	cat("\t\t   delta-AIC values for models estimating SE
+    \t\t\t\t zero indicates the best model\n\n")
+	print(daic.se, digits=2)
+	cat("\n\n\n")
+
+	res_aicc=rbind(aic, aic.se, daic, daic.se)
+	rownames(res_aicc)=c("AICc","AICc_SE","dAICc", "dAICc_SE")
+
+	return(res_aicc)
+}
+
+Variable.Eco.Imp.Fit <- lapply(split(Eco.Var.Importance$Importance.Model.df, Eco.Var.Importance$Importance.Model.df$Variable), Tree = Binded.Tree,
+                           FUN = function(x, Tree){
+                      
+                             x <- x[,c(1,3)]
+                             
+                             x <- tibble::deframe(x[order(match(x,Tree$tip.label))])
+                             
+                             K <- phytools::phylosig(tree = Tree,
+                                                     x = x,
+                                                     method = "K",
+                                                     test = TRUE,
+                                                     niter = 99999)
+                             
+                             Lambda <- phytools::phylosig(tree = Tree,
+                                                          x = x,
+                                                          method = "lambda",
+                                                          test = TRUE,
+                                                          niter = 99999)
+                             return(list(K = K,
+                                         Lambda = Lambda))})
+
+```
+
+## GAM R2 Importance Alternative Evolutionary Models
+
+```{r, fit evolutionary models}
+
+Eco.Fit.Evol <- lapply(split(Eco.Var.Importance$Importance.Model.df, Eco.Var.Importance$Importance.Model.df$Variable), Tree = Binded.Tree,
+                    FUN = function(x, Tree){
+                      
+                      x <- x[,c(1,3)]
+                      
+                      Trait <- tibble::deframe(x[order(match(x,Tree$tip.label))])
+                      
+                      return(fit.models(trait=Trait, tree = Tree))})
+
+```
+
+## GAM phylo trees
+
+```{r, GAM phylo trees}
+phytools::contMap(Binded.Tree, (Eco.Var.Importance$Importance.Model.df %>%
+                                  dplyr::filter(Variable == "Impervious Surface (%)") %>%
+                                  dplyr::select(Species, Importance) %>%
+                                  deframe()))
+
+phytools::contMap(Binded.Tree, (Eco.Var.Importance$Importance.Model.df %>%
+                                  dplyr::filter(Variable == "Population Density") %>%
+                                  dplyr::select(Species, Importance) %>%
+                                  deframe()))
+
+precip.season_vector <- Eco.Var.Importance$Importance.Model.df %>%
+  dplyr::filter(Variable == "Precipitation Seasonality") %>%
+  dplyr::select(Species, Importance) %>%
+  deframe()
+
+precip.season_eb <- geiger::fitContinuous(Binded.Tree, precip.season_vector, model = "EB")
+
+a <- precip.season_eb$opt$rate
+
+alpha <- precip.season_eb$opt$a
+
+tree.eb <- rescale(Binded.Tree, model = "EB", a = alpha)
+
+phytools::contMap(tree.eb, precip.season_vector)
+
+```
+
+## Age-Range Correlations
+
+### Age-Range Niche Overlap
+
+```{r, function from phyloclim}
+# this is all directly from phyloclim but phyloclim is not longer avaiable on cran so I had to pull it from the github respository
+age.range.correlation <- function(phy, overlap, tri = "upper", 
+                                  n = 10000){
+  
+  nbConnectingNodes <- function(phy, npair){
+	ntips <- length(phy$tip.label)
+	nds <- getMRCA(phy, npair)
+	nds <- descendants(phy, nds, internal = TRUE)
+	if (identical(sort(nds), sort(npair)))
+		nb <- 1										else {
+		nds <- nds[nds > ntips]
+		check <- function(x, npair)
+			any(npair %in% descendants(phy, x))
+		id <- sapply(nds, check, npair = npair)
+		nds <- nds[id] 
+		nb <- length(nds) + 1 
+	}
+	nb
+  }
+  
+  descendants <-
+function(tree, node, internal = FALSE, string = FALSE){
+	
+	tips <- seq(along = tree$tip.label)
+	x <- tree$edge[,2][tree$edge[,1] == node]
+	repeat{
+		xx <- x
+		x <- sort(unique(c(x, tree$edge[,2][tree$edge[,1] %in% x])))
+		if (identical(x, xx)) break
+	}
+	# return tip number if input is tip number:
+	# -----------------------------------------
+	if (length(x) == 0) x <- node
+	if (!internal)
+		x <- x[x %in% tips]
+	if (string)
+		x <- tree$tip.label[x]
+	x
+}
+	
+  nested.mean.overlap <- function(phy, node, olap){
+	
+	# match ordering of phy and olap
+	# ------------------------------
+	id <- match(phy$tip.label, rownames(olap))
+	olap <- olap[id, id]
+	
+	# get daughter nodes
+	# ------------------
+	d2 <- phy$edge[phy$edge[, 1] == node, 2]
+	
+	# get descendents of both daughter nodes
+	# --------------------------------------
+	C1 <- descendants(phy, d2[1])
+	C2 <- descendants(phy, d2[2])
+	
+	# calculate mean overlap
+	# ----------------------
+	o <- 0
+    for (j in C1){
+        for (k in C2){
+		    n <- nbConnectingNodes(phy, c(j, k))
+	        o <- o + 0.5 ^ (n - 1) * olap[j, k]
+	    }
+    }
+    o
+  }
+  
+	# check input
+	# -----------
+	if (!inherits(phy, "phylo")) 
+	  stop("object 'phy' is not of class 'phylo'")
+	if (!is.ultrametric(phy))
+    stop("object 'phy' must be ultrametric")
+    		
+	# ages:
+	# -----
+	age <- branching.times(phy)	
+	
+	# make matrix symmetrical
+	# -----------------------
+	ovlap <- overlap
+	if (tri == "upper")
+		ovlap[lower.tri(ovlap)] <- t(ovlap)[lower.tri(ovlap)]
+	if (tri == "lower")
+		ovlap[upper.tri(ovlap)] <- t(ovlap)[upper.tri(ovlap)]
+	
+	# match matrix to tree
+	# --------------------
+	id <- match(phy$tip.label, rownames(ovlap))
+	ovlap <- ovlap[id, id]
+	
+	# calculate 'nested mean overlap'
+	# -------------------------------
+	overlap <- sapply(names(age), nested.mean.overlap, phy = phy, 		
+                    olap = ovlap)
+
+	x <- cbind(age, overlap)	
+	x.lm <- lm(overlap ~ age)
+	
+	# randomization:
+	# --------------
+	randomization <- function(phy, o, n, age){
+		id <- sample(seq(along = o[, 1]))
+		rownames(o) <- colnames(o) <- colnames(o)[id]
+		o <- sapply(names(age), nested.mean.overlap, phy = phy, 
+                olap = o)
+		o <- cbind(age, o)
+		o <- lm(o[, 2] ~ age)
+		o$coefficients
+	}
+	random.x <- lapply(1:n, randomization, o = ovlap, 
+                     phy = phy, age = age)
+	random.x <- do.call(rbind, random.x) # do conversion explicitly!
+	
+  ## fraction of intercepts and slopes from the randomization,
+  ## which are greater than the observed values
+  ## ------------------------------------------
+	f.intercept <- random.x[, "(Intercept)" ] > x.lm$coefficients["(Intercept)"]
+  f.intercept <- length(which((f.intercept))) / n
+  
+  f.slope <- random.x[, "age" ] > x.lm$coefficients["age"]
+	f.slope <- length(which(f.slope)) / n
+	
+  ## 2-sided p-values
+  ## ----------------
+	f <- c(f.intercept, f.slope)
+	p <- sapply(f, function(x) 2 * min(x, 1 - x))
+	sig <- cbind(f, p)
+	rownames(sig) <- c("(intercept)", "age")
+	
+	list(age.range.correlation = x, 
+		linear.regression = x.lm, 
+		sig = sig,
+		MonteCarlo.replicates = random.x	
+	)
+}
+
+```
+
+
+```{r, Age-Range Correlation - Niche Overlap}
+
+Overlap.M.Fit.D <- age.range.correlation(Binded.Tree,
+                                                     M.Overlap,
+                                                     tri = "upper",
+                                                     n = 999)
+
+Overlap.M.Fit.I <- age.range.correlation(Binded.Tree,
+                                                     M.Overlap,
+                                                     tri = "lower",
+                                                     n = 999)
+
+Overlap.P.Fit.D <- age.range.correlation(Binded.Tree,
+                                                     P.Overlap,
+                                                     tri = "upper",
+                                                     n = 999)
+
+Overlap.P.Fit.I <- age.range.correlation(Binded.Tree,
+                                                     P.Overlap,
+                                                     tri = "lower",
+                                                     n = 999)
+```
+
+### Age-Range Response Variables
+
+#### Unadjusted
+```{r,Create Responses List}
+List.Unadjust <- split(Compare.Responses.Unadjust, f = Compare.Responses.Unadjust$Variable)
+
+List.Adjust <- split(Compare.Responses.Adjust, f = Compare.Responses.Adjust$Variable)
+
+```
+
+```{r, age-range correlation}
+Unadjusted.Results.List <- lapply(List.Unadjust, FUN = function(x){
+  
+  Df <- x[,c(1,2,12,13)]
+  
+  # get species 
+  Species <- unique(c(unique(Df[,1]), unique(Df[,2])))
+  
+  
+  for(i in 1:length(Species)){
+    if(!any(Df$Species_1 == Species[[i]] & Df$Species_2 == Species[[i]])){
+      Df <- rbind(Df, data.frame(Species_1 = Species[[i]], Species_2 = Species[[i]], d = 1, i = 1))
+    }}
+  
+  Matrix.D <- reshape2::acast(Df, Species_1~Species_2, value.var = "d")
+  
+  Matrix.i <- t(reshape2::acast(Df, Species_1~Species_2, value.var = "i"))
+  
+  Matrix.D[lower.tri(Matrix.D)] <- Matrix.i[lower.tri(Matrix.i)]
+  
+  Results.D <- age.range.correlation(Binded.Tree,
+                                              Matrix.D,
+                                              tri = "upper", n = 999)
+  
+  Results.I <- age.range.correlation(Binded.Tree,
+                                              Matrix.D,
+                                              tri = "lower", n = 999)
+  
+  List <- list(
+    "D" = list(Results.D$linear.regression,
+               Results.D$sig),
+    "I" = list(Results.I$linear.regression,
+               Results.I$sig))
+  
+  return(List)})
+
+Adjusted.Results.List <- lapply(List.Adjust, FUN = function(x){
+  
+  Df <- x[,c(1,2,12,13)]
+  
+  # get species 
+  Species <- unique(c(unique(Df[,1]), unique(Df[,2])))
+  
+  
+  for(i in 1:length(Species)){
+    if(!any(Df$Species_1 == Species[[i]] & Df$Species_2 == Species[[i]])){
+      Df <- rbind(Df, data.frame(Species_1 = Species[[i]], Species_2 = Species[[i]], d = 1, i = 1))
+    }}
+  
+  Matrix.D <- reshape2::acast(Df, Species_1~Species_2, value.var = "d")
+  
+  Matrix.i <- t(reshape2::acast(Df, Species_1~Species_2, value.var = "i"))
+  
+  Matrix.D[lower.tri(Matrix.D)] <- Matrix.i[lower.tri(Matrix.i)]
+  
+  Results.D <- age.range.correlation(Binded.Tree,
+                                              Matrix.D,
+                                              tri = "upper", n = 999)
+  
+  Results.I <- age.range.correlation(Binded.Tree,
+                                              Matrix.D,
+                                              tri = "lower", n = 999)
+  
+  List <- list(
+    "D" = list(Results.D$linear.regression,
+               Results.D$sig),
+    "I" = list(Results.I$linear.regression,
+               Results.I$sig))
+  
+  return(List)})
+```
+
+## Figures
+
+
+figure of urbanization related response curves
+```{r, response curves}
+Colors <- rep((ggsci::pal_npg(palette = c("nrc"), alpha = 1)(10)), length.out = 13)
+
+ggplot2::ggplot(data = (dplyr::bind_rows(Response.list) %>%
+                          dplyr::ungroup(.)), aes(x = Env, y = Suitability, 
+                                                  color = Species, group = Species,
+                                                  linetype = Species)) +
+  geom_line() + 
+  facet_wrap(~Variable, scales = "free_x", strip.position = "bottom") +
+  scale_color_manual(values = Colors) +
+  scale_linetype_manual(values = c("solid", "dashed", "dotted", "dotdash",
+                                   "longdash","F1", "twodash", "dashed", "4C88C488", 
+                                   "12345678", "dashed", "dotted", "solid")) +
+  labs(x = NULL, y = "Suitability") + 
+  theme_minimal() +
+   theme(
+    panel.grid = element_blank(),            # Remove grid lines
+    panel.background = element_blank(),      # Remove background fill
+    panel.border = element_blank(),          # Remove panel borders
+    axis.line.y = element_line(color = "black"), # Keep Y-axis lines only
+    axis.text.y = element_text(color = "black"),
+    axis.line = element_line(color = "black"),
+    strip.placement = "outside"              # Place facet labels outside of the plot area
+  )
+  
+
+ggplot2::ggplot(data = (dplyr::bind_rows(Response.list) %>%
+                          dplyr::ungroup(.) %>%
+                          dplyr::filter(Variable %in% c(#"Canopy Cover (%)"#,
+                                                        #"Light at Night (nW/cm2/sr)"#,
+                                                        #"Population Density"#,
+                                                        "Impervious Surface (%)"
+                                                       ))), 
+                aes(x = Env, y = Suitability, 
+                                                  color = Species, group = Species,
+                                                  linetype = Species)) +
+  geom_line() + 
+  #facet_wrap(~Variable, scales = "free_x", strip.position = "bottom") +
+  scale_color_manual(values = Colors) +
+  scale_linetype_manual(values = c("solid", "dashed", "dotted", "dotdash",
+                                   "longdash","F1", "twodash", "dashed", "4C88C488", 
+                                   "12345678", "dashed", "dotted", "solid")) +
+  labs(x = NULL, y = "Suitability") + 
+  theme_minimal() +
+   theme(
+    panel.grid = element_blank(),            # Remove grid lines
+    panel.background = element_blank(),      # Remove background fill
+    panel.border = element_blank(),          # Remove panel borders
+    axis.line.y = element_line(color = "black"), # Keep Y-axis lines only
+    axis.text.y = element_text(color = "black"),
+    axis.line = element_line(color = "black"),
+    strip.placement = "outside",
+    text = element_text(family = "serif"),
+    legend.text = element_text(face = "italic")
+  )
+
+```
+
+```{r, variable importance graphs}
+
+custom.colors <- c(
+  "Urbanization" = "#00A087FF",   # Red from NPG palette
+  "Precipitation" = "#4DBBD5FF",   # Blue from NPG palette
+  "Temperature" = "#E64B35FF",     # Green from NPG palette
+  "Elevation" = "#3C5488FF"        # Orange from NPG palette
+)
+
+ggplot(((dplyr::bind_rows(Eco.Var.Importance$Importance.Model.df) %>%
+          dplyr::mutate(Classification = factor((dplyr::if_else(is.na(Classification),
+                                                               "Elevation", Classification)),
+                                                levels = c("Urbanization",
+                                                           "Precipitation", 
+                                                           "Temperature", 
+                                                           "Elevation")),
+                        Graph = factor("Split", levels = c("Split", "Grouped")),
+                        Variable = factor(Variable,
+                                          levels = c("Canopy Cover (%)",
+                                                     "Impervious Surface (%)",
+                                                     "Light at Night (nW/cm2/sr)",
+                                                     "Population Density",
+                                                     "Precipitation of the Driest Month (mm)",
+                                                     "Precipitation of the Warmest Quarter (mm)",
+                                                     "Precipitation Seasonality",
+                                                     "Mean Diurnal Range (°C)",
+                                                     "Mean Temperature of the Driest Quarter (°C)",
+                                                     "Mean Temperature of the Wettest Quarter (°C)",
+                                                     "Temperature Seasonality",
+                                                     "Elevation (m)"
+                                                     )))) %>%
+          dplyr::bind_rows(., (dplyr::bind_rows(Eco.Var.Importance$Importance.Model.df) %>%
+          dplyr::mutate(Classification = factor((dplyr::if_else(is.na(Classification),
+                                                               "Elevation", Classification)),
+                                                levels = c("Urbanization",
+                                                           "Precipitation",
+                                                           "Temperature", 
+                                                            "Elevation")),
+                        Graph = factor("Grouped", levels = c("Split", "Grouped")),
+                        Variable = Classification) %>%
+            dplyr::filter(Classification != "Elevation")))), 
+       aes(x = Variable, y = Importance , fill = Classification)) +
+  geom_boxplot() +
+  scale_x_discrete(drop = TRUE) +
+  facet_grid(cols = vars(Graph), drop = TRUE, scales = "free_x", space = "free") +
+  scale_fill_manual(values = custom.colors) +
+  labs(x = NULL, y = "Variation Explained (%)") + 
+  theme_minimal() +
+   theme(
+    panel.grid = element_blank(),            # Remove grid lines
+    panel.background = element_blank(),      # Remove background fill
+    panel.border = element_blank(),          # Remove panel borders
+    axis.line.y = element_line(color = "black"), # Keep Y-axis lines only
+    axis.text.y = element_text(color = "black"),
+    axis.line = element_line(color = "black"),
+    axis.text.x = element_text(color = "black", angle = 45, hjust = 1),
+    text = element_text(family = "serif")
+  )
+
+```
+
+```{r, map polygon}
+library(dplyr)
+library(ggplot2)
+library(sf)
+
+Plot.Occs <- Occs.Rare %>%
+ # dplyr::filter(Longitude != min(Longitude)) %>%
+  dplyr::mutate(Species = factor(gsub("_", " ", Species),
+                                 levels = c(gsub("_", " ",
+                                                 unique(Occs.Rare$Species)[-2]), "Eurycea bislineata")),
+                           Longitude = as.numeric(Longitude),
+                           Latitude = as.numeric(Latitude)) %>%
+  dplyr::select(Species, Latitude, Longitude) %>%
+  dplyr::mutate(Clade = dplyr::case_when(Species %in% c("Eurycea multiplicata", 
+                                                        "Eurycea tynerensis") ~ paste0("Clade ", as.character(as.roman(1))),
+                                         Species %in% c("Eurycea bislineata",
+                                                        "Eurycea aquatica",
+                                                        "Eurycea wilderae",
+                                                        "Eurycea cirrigera") ~ paste0("Clade ", as.character(as.roman(2))),
+                                         Species %in% c("Eurycea lucifuga",
+                                                        "Eurycea guttolineata",
+                                                        "Eurycea longicauda") ~ paste0("Clade ", as.character(as.roman(3))),
+                                         Species %in% c("Eurycea hillisi",
+                                                        "Eurycea quadridigitata",
+                                                        "Eurycea chamberlaini",
+                                                        "Eurycea paludicola") ~ paste0("Clade ", as.character(as.roman(4)))),
+                Clade = factor(Clade, levels = c("Clade I", "Clade II", "Clade III", "Clade IV")))
+
+library(dplyr)
+library(ggplot2)
+library(sf)
+
+# Convert the geographic data to an sf object
+Plot.Occs.sf <- st_as_sf(Plot.Occs, coords = c("Longitude", "Latitude"), crs = 4326) %>%
+  group_by(Species, Clade) %>%  # Group by Clade too
+  summarise(geometry = st_convex_hull(st_union(geometry)), .groups = "drop")  # Keep Clade
+
+# Merge North America shapes into one unified geometry
+north_america_merged <- st_union(north_america)
+
+# Crop the polygons to the merged North America outline using st_intersection
+Plot.Occs.sf <- st_intersection(Plot.Occs.sf, north_america_merged)
+
+# Calculate the area of each polygon and add it as a new column
+Plot.Occs.sf <- Plot.Occs.sf %>%
+  mutate(area = st_area(geometry))  # Calculate the area of each polygon
+
+# Reorder by area, smallest last (i.e., descending order of area)
+Plot.Occs.sf <- Plot.Occs.sf %>%
+  arrange(desc(area))  # Reorder in descending order of area
+
+# Define a custom set of 13 distinct colors
+Colors <- c("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", 
+            "#e377c2", "#7f7f7f", "#bcbd22", "aquamarine3", "darkgoldenrod2", "#17becf", 
+            "#c6c6c6")
+
+# Plot the map with black outlines and improved colors
+ggplot() +
+  # Plot the merged North America shape for the background
+  geom_sf(data = north_america_merged, fill = "antiquewhite", color = "black", size = 0.5) +  
+  # Plot the original polygons with black outlines and custom fills
+  geom_sf(data = Plot.Occs.sf, aes(fill = Species), 
+          color = "black", alpha = 0.7, size = 0.7) +  
+  facet_wrap(~Clade, ncol = 2)+
+  # Apply custom color palette
+  scale_fill_manual(values = Colors) +  # Use 13 colors from the custom palette
+  coord_sf(xlim = c(min(Plot.Occs$Longitude) - 1, max(Plot.Occs$Longitude) + 1),
+           ylim = c(min(Plot.Occs$Latitude) - 1, max(Plot.Occs$Latitude) + 1)) +
+  # Add a scale bar
+  annotation_scale(location = "br", width_hint = 0.1) +
+  # Add a north arrow
+  annotation_north_arrow(location = "tl", which_north = "true", 
+                         height = unit(0.4, "cm"), width = unit(0.4, "cm"), 
+                         pad_x = unit(0.2, "cm"), pad_y = unit(0.2, "cm"),
+                         style = north_arrow_orienteering(
+    text_size = 6  # <-- Adjust this value to control the size of "N"
+  )) +
+  # Add axis labels for Longitude and Latitude
+  labs(x = "Longitude", y = "Latitude") +  # Add the axis labels
+  # Customize the theme
+  theme(panel.grid.major = element_line(color = gray(.5), linetype = "dashed", size = 0.5), 
+        panel.background = element_rect(fill = "aliceblue"),
+        panel.border = element_rect(colour = "black", linewidth = 1, fill = NA),
+        text = element_text(family = "serif", size = 8),
+        axis.title = element_text(size = 12),
+        legend.position = "bottom",
+        legend.background = element_blank(),
+        legend.key = element_blank())
+
+
+
+```
+
+```{r, map points}
+Plot.Occs <- Occs.Rare %>%
+ # dplyr::filter(Longitude != min(Longitude)) %>%
+  dplyr::mutate(Species = factor(gsub("_", " ", Species),
+                                 levels = c(gsub("_", " ",
+                                                 unique(Occs.Rare$Species)[-2]), "Eurycea bislineata")),
+                           Longitude = as.numeric(Longitude),
+                           Latitude = as.numeric(Latitude)) %>%
+  dplyr::select(Species, Latitude, Longitude) 
+
+
+north_america <- ne_countries(continent = "North America", scale = "medium", returnclass = "sf")
+
+# Convert your geographic data to an sf object
+Plot.Occs.sf <- st_as_sf(Plot.Occs, coords = c("Longitude", "Latitude"), crs = 4326)
+
+library(ggplot2)
+library(sf)
+
+ggplot() +
+  # Plot the world map
+  geom_sf(data = north_america, fill = "antiquewhite", color = "black", size = 0.5) +
+  # Plot the points based on geographic coordinates (using geom_point)
+  geom_point(data = Plot.Occs, 
+             aes(x = Longitude, y = Latitude, fill = Species, shape = Species),  # Fill by Species, shape by Species
+             color = "black",  # Black border
+             size = 3, 
+             stroke = 0.5) +  # Set border thickness
+  facet_wrap(~Species, scales = "free") +
+  
+  # Manual color scale for the fill based on Species
+  scale_fill_manual(values = Colors) +  # Color the points by Species
+  scale_shape_manual(values = c(22, 21, 23, 24, 25, 21, 22, 23, 24, 25, 21, 23, 22)) +  # Assign shapes
+  coord_sf() +
+  # Set the map limits to the bounding box of the points
+  #coord_sf(xlim = c(min(Plot.Occs$Longitude) - 1, max(Plot.Occs$Longitude) + 1),
+         #  ylim = c(min(Plot.Occs$Latitude) - 1, max(Plot.Occs$Latitude) + 1)) + 
+  
+  # Add a scale bar
+  annotation_scale(location = "br", width_hint = 0.1) +  # Scale bar at the bottom-right
+  
+  # Add a north arrow
+  annotation_north_arrow(location = "tl", which_north = "true", 
+                         height = unit(1, "cm"), width = unit(1, "cm"), 
+                         pad_x = unit(0.2, "cm"), pad_y = unit(0.2, "cm")) +
+  
+  # Customize the theme
+  theme(panel.grid.major = element_line(color = gray(.5), linetype = "dashed", size = 0.5), 
+        panel.background = element_rect(fill = "aliceblue"),
+        panel.border = element_rect(colour = "black", linewidth = 1, fill = NA),
+        text= element_text(family="serif", size = 8),
+        axis.title = element_text(size = 12),
+        legend.position="bottom",
+        legend.background = element_blank(),
+        legend.key = element_blank())
+
+plot(Binded.Tree)
+```
+
+```{r, box plot response overlap}
+custom.colors <- c(
+  "Urbanization" = "#00A087FF",   # Red from NPG palette
+  "Precipitation" = "#4DBBD5FF",   # Blue from NPG palette
+  "Temperature" = "#E64B35FF",     # Green from NPG palette
+  "Elevation" = "#3C5488FF"        # Orange from NPG palette
+)
+
+ggplot((Compare.Responses.Adjust %>%
+          dplyr::mutate(Type = "Adjusted") %>%
+         dplyr::bind_rows(., (Compare.Responses.Unadjust %>%
+                                dplyr::mutate(Type = "Unadjusted"))) %>%
+          dplyr::mutate(Classification = factor((dplyr::if_else(is.na(Classification),
+                                                               "Elevation", Classification)),
+                                                levels = c("Precipitation", "Temperature", 
+                                                           "Urbanization", "Elevation"))) %>%
+          dplyr::select(Species_1, Species_2, Variable, Classification, d, i, Type) %>%
+         tidyr::pivot_longer(., cols = c("d", "i"), names_to = "Overlap Metric") %>%
+          dplyr::mutate(`Overlap Metric` = dplyr::if_else(`Overlap Metric` == "d", "D", "I"))), 
+       aes(x = Variable, y = value, fill = Type)) +
+  geom_boxplot() +
+  ggsci::scale_fill_npg() +
+  facet_wrap(~`Overlap Metric`) +
+  labs(x = NULL, y = "Overlap") + 
+  theme_minimal() +
+   theme(
+    panel.grid = element_blank(),            # Remove grid lines
+    panel.background = element_blank(),      # Remove background fill
+    panel.border = element_blank(),          # Remove panel borders
+    axis.line.y = element_line(color = "black"), # Keep Y-axis lines only
+    axis.text.y = element_text(color = "black"),
+    axis.line = element_line(color = "black"),
+    axis.text.x = element_text(color = "black", angle = 45, hjust = 1),
+    text = element_text(family = "serif"),
+    strip.background = element_rect(fill = NA, color = NA))
+
+
+ggplot(
+  (Compare.Responses.Adjust %>%
+     dplyr::mutate(Type = "Adjusted") %>%
+     dplyr::bind_rows(., 
+                      (Compare.Responses.Unadjust %>%
+                         dplyr::mutate(Type = "Unadjusted"))) %>%
+     dplyr::filter(!is.na(Classification)) %>%
+     dplyr::select(Species_1, Species_2, Variable, Classification, d, i, Type) %>%
+     tidyr::pivot_longer(., cols = c("d", "i"), names_to = "Overlap Metric") %>%
+     dplyr::mutate(
+       `Overlap Metric` = dplyr::if_else(`Overlap Metric` == "d", "D", "I"),
+       Classification = factor(
+         dplyr::if_else(is.na(Classification), "Elevation", Classification),
+         levels = c("Urbanization", "Precipitation", "Temperature", "Elevation")
+       )  # Explicitly set the factor levels for Classification
+     )
+  ),
+  aes(x = Classification, y = value, fill = Classification)
+) +
+  geom_boxplot() +
+  facet_grid(~`Overlap Metric` + Type) +
+  scale_fill_manual(values = custom.colors) +
+  labs(x = NULL, y = "Overlap") +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),            # Remove grid lines
+    panel.background = element_blank(),      # Remove background fill
+    panel.border = element_blank(),          # Remove panel borders
+    axis.line.y = element_line(color = "black"), # Keep Y-axis lines only
+    axis.text.y = element_text(color = "black"),
+    axis.line = element_line(color = "black"),
+    axis.text.x = element_text(color = "black", angle = 45, hjust = 1),
+    text = element_text(family = "serif")
+  )
+
+
+ggplot((Compare.Responses.Adjust %>%
+          dplyr::mutate(Type = "Adjusted") %>%
+         dplyr::bind_rows(., (Compare.Responses.Unadjust %>%
+                                dplyr::mutate(Type = "Unadjusted"))) %>%
+         dplyr::filter(!is.na(Classification)) %>%
+          dplyr::select(Species_1, Species_2, Variable, Classification, d, i, Type) %>%
+         tidyr::pivot_longer(., cols = c("d", "i"), names_to = "Overlap Metric") %>%
+          dplyr::mutate(`Overlap Metric` = dplyr::if_else(`Overlap Metric` == "d", "D", "I"),
+                        Classification = factor(
+         dplyr::if_else(is.na(Classification), "Elevation", Classification),
+         levels = c("Urbanization", "Precipitation", "Temperature", "Elevation"))) %>%
+          dplyr::filter(`Overlap Metric` == "I")), 
+       aes(x = Classification, y = value, fill = Classification)) +
+  geom_boxplot() +
+  facet_wrap(~Type) +
+  ggsci::scale_fill_npg() +
+  labs(x = NULL, y = "Overlap") + 
+  theme_minimal() +
+   theme(
+    panel.grid = element_blank(),            # Remove grid lines
+    panel.background = element_blank(),      # Remove background fill
+    panel.border = element_blank(),          # Remove panel borders
+    axis.line.y = element_line(color = "black"), # Keep Y-axis lines only
+    axis.text.y = element_text(color = "black"),
+    axis.line = element_line(color = "black"),
+    axis.text.x = element_text(color = "black", angle = 45, hjust = 1),
+    text = element_text(family = "serif")
+  )
+
+```
